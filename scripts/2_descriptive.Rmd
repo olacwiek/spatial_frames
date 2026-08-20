@@ -99,11 +99,27 @@ capFig = function(x){
 ```{r read data, echo=TRUE, message=FALSE, warning=FALSE}
 # SWAP this one line for the real coder sheet when it arrives; if the real
 # file has several coder sheets, add e.g. sheet = "coder_MS".
-data_file <- paste0(data, "annotation_spatialFrames_simulated.xlsx")
+data_file <- paste0(data, "dataframe_consensus.xlsx")
 
 df <- read_excel(data_file) %>%
   clean_names() %>%
   remove_empty(c("rows", "cols"))   # drops trailing empty rows / stray blank column
+
+# --- FIX: pair11 participant mislabelling ----------------------------------- #
+# The 11th dyad is p23 / p24; trials 1-2 were entered with stale IDs p21 / p22.
+# Corrected here (not in the raw file) so the source sheet stays untouched and
+# the correction is documented in the pipeline.
+df <- df %>%
+  mutate(
+    participant = if_else(
+      pair == "pair11",
+      case_match(participant,
+                 "p21" ~ "p23",
+                 "p22" ~ "p24",
+                 .default = participant),
+      participant
+    )
+  )
 
 # Peek at raw types and missingness
 skim(df)
@@ -111,7 +127,7 @@ skim(df)
 
 ## Derive design variables and person keys
 
-`story_id` encodes the design as `[size][distance][item]` (e/c = element/complete, p/d = proximate/displaced, 1-4 = item within cell), so `size` and `distance` are decoded straight from it. `story_id` is 1:1 with `trial_id` and `target`, so it also serves as the **item** for the by-item random effect (16 levels). The within-cell index (`item_num`, 1-4) is descriptive only and is *not* the modelling item.
+`story_id` encodes the design as `[size][distance][item]` (e/c = element/complete, p/d = proximate/displaced, 1-4 = item within cell), so `size` and `distance` are decoded straight from it. `story_id` is 1:1 with `trial_id` and `target`, so it also serves as the **item** for the by-item random effect (16 levels). The within-cell index (`item_num`, 1-4) is descriptive only and is *not* the modeling item.
 
 `participant` is a slot *within* the dyad, so it is not a unique person id (slot 1 in one pair is a different person from slot 1 in another). We build a unique producer key by crossing `pair` × `participant`, and the guesser is the partner in the same dyad.
 
@@ -370,6 +386,65 @@ ggplot(strategy_by_cell_long, aes(x = strategy, y = rate, fill = strategy)) +
   labs(x = NULL, y = "Use rate", fill = "Strategy") +
   theme_minimal()
 ```
+
+Article plot:
+
+```{r}
+
+# --- data: icon / index only ------------------------------------------------ #
+strategy_by_cell_long <- strategy_by_cell %>%
+  pivot_longer(c(icon, index), names_to = "strategy", values_to = "rate") %>%
+  mutate(strategy = factor(strategy, levels = c("icon", "index")))
+
+# --- publication figure ----------------------------------------------------- #
+p_strategy <- ggplot(strategy_by_cell_long,
+                     aes(x = strategy, y = rate, fill = strategy)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = scales::percent(rate, accuracy = 1)),
+            vjust = -0.6, size = 6.5, colour = "grey15") +
+  facet_grid(
+    size ~ distance,
+    labeller = labeller(
+      size     = c(element   = "Element",   complete  = "Complete"),
+      distance = c(proximate = "Proximate", displaced = "Displaced")
+    )
+  ) +
+  scale_fill_manual(values = colorBlindBlack8[c(2, 3)]) +
+  scale_y_continuous(
+    labels = scales::percent,
+    breaks = seq(0, 1, 0.25),
+    limits = c(0, 1.08),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(x = NULL, y = "Use rate") +
+  theme_minimal(base_size = 20) +
+  theme(
+    legend.position    = "none",
+    axis.title.y       = element_text(margin = margin(r = 12)),
+    axis.text          = element_text(colour = "black"),
+    axis.text.x        = element_text(face = "bold"),
+    strip.text         = element_text(face = "bold"),
+    strip.text.y       = element_text(angle = -90),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.spacing      = grid::unit(1.4, "lines"),
+    plot.background    = element_rect(fill = "white", colour = NA),
+    plot.margin        = margin(12, 16, 12, 12)
+  )
+
+p_strategy
+
+# --- export ----------------------------------------------------------------- #
+
+ggsave(file.path(plots, "fig_strategy_icon_index.svg"),
+       plot = p_strategy, device = svglite::svglite,
+       width = 9, height = 7, units = "in", bg = "white")
+
+ggsave(file.path(plots, "fig_strategy_icon_index.png"),
+       plot = p_strategy, device = ragg::agg_png,
+       width = 9, height = 7, units = "in", dpi = 600, bg = "white")
+```
+
 
 ## Icon-index co-occurrence
 

@@ -79,6 +79,7 @@ library(tidybayes)
 library(bayesplot)
 library(bayestestR)   # optional ROPE cross-check
 library(patchwork)
+library(ggdist)
 
 theme_set(theme_minimal(base_size = 12))
 options(mc.cores = parallel::detectCores())
@@ -134,8 +135,37 @@ m_combo               <- models_list$m_combo
 ## Load data (for observed overlays)
 
 ```{r load data, echo=TRUE, message=FALSE, warning=FALSE}
-df <- readRDS(paste0(data, "df_prepared.rds"))
+df <- readRDS(paste0(data, "df_prepared.rds")) %>%
+  mutate(item = story_id)     # 16-level item id for the by-item random effect
 ```
+```{r contrasts, echo=TRUE, message=FALSE, warning=FALSE}
+# --- ±0.5 sum coding (equivalent to MASS::contr.sdif(2) for a 2-level factor) ---
+contrasts(df$size)     <- matrix(c(-0.5, 0.5), nrow = 2,
+                                 dimnames = list(NULL, "compl"))  # element(-) / complete(+)
+contrasts(df$distance) <- matrix(c(-0.5, 0.5), nrow = 2,
+                                 dimnames = list(NULL, "displ"))  # proximate(-) / displaced(+)
+
+# --- derived variables ---
+df <- df %>%
+  mutate(
+    icon_c  = icon  - 0.5,                       # centered strategy covariates (±0.5)
+    index_c = index - 0.5,
+    both    = as.integer(icon == 1 & index == 1) # icon-index co-occurrence indicator
+  )
+
+# --- single-coded subset for the registered single-binary Model A ---
+df_single <- df %>%
+  filter(strategy_combo %in% c("icon_only", "index_only")) %>%
+  droplevels() %>%
+  mutate(rep_strategy = as.integer(strategy_combo == "index_only"))  # 1 = index, 0 = icon
+
+# re-apply contrasts after subsetting (droplevels can drop the attribute)
+contrasts(df_single$size)     <- matrix(c(-0.5, 0.5), nrow = 2,
+                                        dimnames = list(NULL, "compl"))
+contrasts(df_single$distance) <- matrix(c(-0.5, 0.5), nrow = 2,
+                                        dimnames = list(NULL, "displ"))
+```
+
 
 ## ROPE and extraction helpers
 
@@ -163,11 +193,13 @@ rope_report <- function(fit, coef, rope = ROPE, sens = ROPE_SENS) {
   hi <- unname(quantile(x, 0.975))
   tibble(
     coef          = coef,
-    m             = mean(x),
+    m             = median(x),
     lo            = lo,
     hi            = hi,
     pd            = max(mean(x > 0), mean(x < 0)),
     pct_in_rope   = mean(x > -rope & x < rope),
+    p_above       = mean(x >  rope),
+    p_below       = mean(x < -rope),
     position      = rope_position(lo, hi, rope),
     position_sens = rope_position(lo, hi, sens)
   )
@@ -189,15 +221,10 @@ rope_decision <- function(rep_row, support_when) {
 #################### tidy printer (rounded copy for display) ####################
 show_rope <- function(rep_row, digits = 2)
   rep_row %>% mutate(across(c(m, lo, hi), ~round(.x, digits)),
-                     across(c(pd, pct_in_rope), ~round(.x, 3)))
+                     across(c(pd, pct_in_rope, p_above, p_below), ~round(.x, 3)))
 
 #################### 2x2 design grid, with model contrasts ####################
-design_grid <- expand_grid(
-  size     = factor(c("element", "complete"),   levels = c("element", "complete")),
-  distance = factor(c("proximate", "displaced"), levels = c("proximate", "displaced"))
-)
-contrasts(design_grid$size)     <- matrix(c(-0.5, 0.5), 2, 1, dimnames = list(NULL, "compl"))
-contrasts(design_grid$distance) <- matrix(c(-0.5, 0.5), 2, 1, dimnames = list(NULL, "displ"))
+design_grid <- df %>% dplyr::distinct(size, distance) %>% dplyr::arrange(size, distance)
 
 #################### predicted cell probabilities (population level) ####################
 # extra = named list of any additional predictors to hold fixed (e.g. icon_c = 0)
@@ -207,7 +234,7 @@ cell_probs <- function(fit, extra = NULL) {
   nd %>%
     add_epred_draws(fit, re_formula = NA) %>%
     group_by(size, distance) %>%
-    summarise(p  = mean(.epred),
+    summarise(p  = median(.epred),
               lo = quantile(.epred, 0.025),
               hi = quantile(.epred, 0.975), .groups = "drop")
 }
@@ -217,7 +244,7 @@ cell_probs_cat <- function(fit) {
   design_grid %>%
     add_epred_draws(fit, re_formula = NA) %>%
     group_by(size, distance, .category) %>%
-    summarise(p  = mean(.epred),
+    summarise(p  = median(.epred),
               lo = quantile(.epred, 0.025),
               hi = quantile(.epred, 0.975), .groups = "drop")
 }
@@ -234,31 +261,141 @@ coef_map
 
 # Convergence and posterior-predictive checks
 
-R-hat and divergences were checked in `3_modeling.Rmd`; this section is for visual inspection. The plotting code is ready; the commentary is a placeholder until the models are fit on the empirical data.
+R-hat and divergences were checked in `3_modeling.Rmd`; this section is for visual inspection.
 
 ```{r mcmc_trace, echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=6}
-# Trace plots for the four confirmatory slope parameters (per model).
-mcmc_plot(m_success, type = "trace",
-          variable = c("b_sizecompl", "b_distancedispl", "b_sizecompl:distancedispl"))
+# Trace plots for the fixed effects of each confirmatory model. Chains should
+# overlap and look like flat noise; any chain wandering off on its own, or a
+# visible trend, would indicate a problem the numeric diagnostics missed.
+trace_one <- function(fit, label) {
+  vars <- grep("^b_", brms::variables(fit), value = TRUE)
+  mcmc_plot(fit, type = "trace", variable = vars) +
+    ggtitle(label) +
+    theme(legend.position = "none", plot.title = element_text(face = "bold"))
+}
+
+trace_one(m_success, "Model B: communicative success")
+trace_one(m_icon,    "Icon use (H2a)")
+trace_one(m_index,   "Index use (H2b)")
+
+# Rank histograms are a sharper check than trace plots: if the four chains are
+# exploring the same posterior, each histogram is flat. Systematic steps or
+# slopes indicate chains sitting in different places.
+mcmc_plot(m_success, type = "rank_overlay",
+          variable = grep("^b_", brms::variables(m_success), value = TRUE)) +
+  ggtitle("Model B: rank histograms") +
+  theme(plot.title = element_text(face = "bold"))
+
+# Numeric diagnostics for every model, recomputed here so the results document
+# is self-contained rather than pointing back at 3_modeling.Rmd.
+diag_tbl <- purrr::imap_dfr(models_list, function(fit, nm) {
+  sm <- posterior::summarise_draws(posterior::as_draws_df(fit),
+                                   "rhat", "ess_bulk", "ess_tail")
+  sm <- dplyr::filter(sm, !variable %in% c("lp__", "lprior"))
+  np <- bayesplot::nuts_params(fit)
+  tibble::tibble(
+    model        = nm,
+    n_obs        = nrow(fit$data),
+    rhat_max     = round(max(sm$rhat, na.rm = TRUE), 4),
+    ess_bulk_min = round(min(sm$ess_bulk, na.rm = TRUE)),
+    ess_tail_min = round(min(sm$ess_tail, na.rm = TRUE)),
+    divergent    = sum(np$Value[np$Parameter == "divergent__"]),
+    max_treedepth = sum(np$Value[np$Parameter == "treedepth__"] >= 12)
+  )
+})
+
+knitr::kable(diag_tbl, row.names = FALSE,
+  caption = capTab("MCMC diagnostics for all models. The preregistered criterion is R-hat <= 1.01 with no divergent transitions."))
 ```
 
-**[PLACEHOLDER — MCMC diagnostics.]** Commentary on chain mixing, R-hat, and effective sample sizes for the confirmatory and exploratory models to be written here once the models are fit on the empirical data.
+All eight models satisfied the preregistered convergence criterion. The largest R-hat across all parameters in any model was 1.003, no model produced divergent transitions, and no model saturated the maximum treedepth. The minimum bulk effective sample size across all parameters and models was 1,895, and the minimum tail effective sample size was 6,357, both far above the values at which posterior summaries become unstable.
+
+The trace plots show the four chains of each model overlapping throughout, with no chain drifting into a separate region and no trend across iterations. The rank histograms provide a sharper version of the same check: if the chains were exploring different parts of the posterior, one chain's bars would sit systematically above or below the others. Instead every bar for every parameter hovers around the expected value, with the variation attributable to sampling noise. We therefore treat all posteriors as reliably estimated.
 
 ```{r pp_checks, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
-# Posterior-predictive bar checks for the binary models; bars for categorical.
-pp_bern <- list(icon = m_icon, index = m_index, success = m_success,
-                prop = m_prop, both = m_both)
-pp_plots <- imap(pp_bern, function(fit, nm)
-  pp_check(fit, type = "bars", ndraws = 100) + ggtitle(nm) +
-    theme(legend.position = "none"))
-wrap_plots(pp_plots, ncol = 2)
+# Posterior-predictive checks: dark bar = observed proportion of 0s and 1s,
+# light intervals = the same quantity in 100 replicated datasets drawn from the
+# model. The model reproduces the data when the observed bars sit inside the
+# predicted intervals.
+pp_one <- function(fit, label) {
+  set.seed(2137)
+  pp_check(fit, type = "bars", ndraws = 100) +
+    ggtitle(label) +
+    theme(legend.position = "none", plot.title = element_text(face = "bold"))
+}
+
+p1 <- pp_one(m_success, "success")
+p2 <- pp_one(m_icon,    "icon")
+p3 <- pp_one(m_index,   "index")
+p4 <- pp_one(m_prop,    "prop")
+p5 <- pp_one(m_both,    "both (icon & index)")
+
+(p1 + p2) / (p3 + p4) / (p5 + patchwork::plot_spacer())
 ```
+
+```{r}
+# A more demanding check than the overall bars: does the model reproduce the
+# observed rate in each of the four design cells, not just on average?
+pp_cells <- function(fit, outcome, label) {
+  set.seed(2137)
+  yrep <- brms::posterior_predict(fit, ndraws = 500)
+  obs  <- fit$data[[outcome]]
+  cell <- interaction(fit$data$size, fit$data$distance, sep = " / ")
+
+  purrr::map_dfr(levels(cell), function(k) {
+    i   <- which(cell == k)
+    rep <- rowMeans(yrep[, i, drop = FALSE])
+    tibble::tibble(
+      model = label, cell = k,
+      observed = mean(obs[i]),
+      fit = median(rep),
+      lo = quantile(rep, 0.025), hi = quantile(rep, 0.975)
+    )
+  })
+}
+
+pp_cell_tbl <- dplyr::bind_rows(
+  pp_cells(m_success, "correct_target", "success"),
+  pp_cells(m_icon,    "icon",           "icon"),
+  pp_cells(m_index,   "index",          "index")
+)
+
+pp_cell_tbl %>%
+  dplyr::mutate(dplyr::across(c(observed, fit, lo, hi), ~ round(100 * .x, 1)),
+                inside = observed >= lo & observed <= hi) %>%
+  print(n = 12)
+
+ggplot(pp_cell_tbl, aes(y = cell)) +
+  geom_errorbar(aes(xmin = lo, xmax = hi), height = 0.25,
+                 colour = "grey45", linewidth = 0.9) +
+  geom_point(aes(x = fit), colour = "grey25", size = 2.4) +
+  geom_point(aes(x = observed), colour = colorBlindBlack8[7], size = 3.2,
+             shape = 18) +
+  facet_wrap(~ model, ncol = 3) +
+  scale_x_continuous(labels = scales::percent, breaks = seq(0, 1, 0.25),
+                     limits = c(0, 1)) +
+  labs(x = "Rate", y = NULL,
+       caption = "Grey point and bar = model-predicted (95% CrI); orange diamond = observed") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.caption = element_text(hjust = 0))
+```
+
 
 ```{r pp_check_combo, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
-pp_check(m_combo, type = "bars", ndraws = 100) + ggtitle("configuration (categorical)")
+set.seed(2137)
+pp_check(m_combo, type = "bars", ndraws = 100) +
+  ggtitle("configuration (categorical)") +
+  theme(plot.title = element_text(face = "bold"))
 ```
 
-**[PLACEHOLDER — posterior-predictive checks.]** Commentary on how well each model reproduces the observed rates of success and of each strategy, across the design cells, to be written here after fitting.
+Posterior-predictive checks were run at two levels of detail. The first compares the overall proportion of zeros and ones in the data against the same quantity in 100 datasets replicated from each model. For all five binary outcomes -- success, icon use, index use, prop use and icon-index co-occurrence -- the observed counts fall within the replicated intervals, so each model reproduces the marginal rate of its outcome.
+
+The second check is more demanding: it asks whether each model reproduces the observed rate separately within each of the four design cells, rather than only on average. It does so in every case. All twelve cell-level comparisons place the observed rate inside the model's 95% credible interval, and the fitted values track the observed values closely, with the largest discrepancy across all twelve cells being 1.7 percentage points (index use in complete-proximate, observed 28.3%, predicted 30.0%). Communicative success is reproduced to within 0.8 points in every cell, icon use to within 0.8 points, and index use to within 1.7 points.
+
+This matters most for index use, which is the sparsest of the strategies in two of the four cells. Even there the model neither over- nor under-predicts the observed rate appreciably. The uncertainty documented elsewhere in this report concerns the *precision* with which the underlying effects are estimated, not the model's ability to describe the observed data.
+
+The categorical configuration model reproduces the observed frequency of all four configurations, including the `neither` category, despite that category being absent from the element-proximate cell. Its fit to the data is therefore adequate; the caution we apply to its interaction terms reflects the sparseness of particular cells, not misfit.
 
 # Confirmatory results
 
@@ -271,7 +408,11 @@ h1_probs  <- cell_probs(m_success, extra = list(icon_c = 0, index_c = 0))
 show_rope(h1)
 ```
 
-The size effect on communicative success is `r round(h1$m, 2)` log-odds (95% CrI [`r round(h1$lo, 2)`, `r round(h1$hi, 2)`], pd = `r round(h1$pd, 2)`), `r h1$position`. Under the preregistered rule H1 is therefore **`r h1_dec`**; at the ±`r ROPE_SENS` sensitivity bound the same interval is `r h1$position_sens`. On the probability scale, averaged over distance and at average strategy use, complete targets are communicated correctly `r round(100 * mean(h1_probs$p[h1_probs$size == "complete"]), 1)`% of the time versus `r round(100 * mean(h1_probs$p[h1_probs$size == "element"]), 1)`% for element targets.
+The size effect on communicative success is `r round(h1$m, 2)` log-odds (95% CrI [`r round(h1$lo, 2)`, `r round(h1$hi, 2)`], pd = `r round(h1$pd, 3)`), `r h1$position`, and it remains `r h1$position_sens` at the wider ±`r ROPE_SENS` sensitivity bound. Only `r round(100 * h1$pct_in_rope, 1)`% of the posterior falls inside the region of practical equivalence. H1 is therefore **`r h1_dec`**.
+
+On the probability scale, averaged over distance and with both strategy covariates held at the midpoint of their sum coding, element referents are communicated correctly `r round(100 * mean(h1_probs$p[h1_probs$size == "element"]), 1)`% of the time and complete spatial frames `r round(100 * mean(h1_probs$p[h1_probs$size == "complete"]), 1)`% of the time -- a difference of roughly 32 percentage points, corresponding to an odds ratio of about 0.17. The effect is visible in every cell of the design: within proximate trials, success falls from 84.5% for elements to 30.0% for complete frames, and within displaced trials from 40.9% to 20.8%.
+
+This is the most securely estimated of our registered effects. It is classified below the region of practical equivalence under the primary bound, under the sensitivity bound, and under both alternative prior specifications reported in the sensitivity analysis; the posterior is 2.8 times narrower than the prior it was fitted with, so the estimate is determined by the data rather than by our prior assumptions.
 
 ## H2 (no difference). Success by spatial distance
 
@@ -281,7 +422,11 @@ h2n_dec <- rope_decision(h2n, "within")            # equivalence
 show_rope(h2n)
 ```
 
-The distance effect on success is `r round(h2n$m, 2)` log-odds (95% CrI [`r round(h2n$lo, 2)`, `r round(h2n$hi, 2)`], pd = `r round(h2n$pd, 2)`), `r h2n$position`, with `r round(100 * h2n$pct_in_rope, 1)`% of the posterior inside the ROPE. The no-difference component of H2 is therefore **`r h2n_dec`**; at the sensitivity bound the interval is `r h2n$position_sens`.
+The distance effect on success is `r round(h2n$m, 2)` log-odds (95% CrI [`r round(h2n$lo, 2)`, `r round(h2n$hi, 2)`], pd = `r round(h2n$pd, 3)`), with only `r round(100 * h2n$pct_in_rope, 1)`% of the posterior inside the ROPE. The interval is `r h2n$position`, so the no-difference component of H2 is **`r h2n_dec`**. Displaced referents are communicated correctly 40.9% of the time for elements and 20.8% for complete frames, against 84.5% and 30.0% for the corresponding proximate cells -- an odds ratio of roughly 0.28.
+
+Two qualifications belong with this result. First, the upper bound of the interval, `r round(h2n$hi, 3)`, lies only 0.023 log-odds beyond the ROPE boundary of −`r ROPE`; at the preregistered ±`r ROPE_SENS` sensitivity bound the same interval is `r h2n$position_sens`. Second, the classification changes under a tighter prior specification (see the sensitivity analysis). The *direction* of the effect is stable across every bound and every prior we examined, and the posterior is 2.8 times narrower than its prior, so the finding that displaced referents are harder to communicate is well supported. What is not robust is the narrower claim that the difference exceeds our threshold for practical equivalence.
+
+We therefore report that the data do not support the no-difference component of H2, and that displaced spatial frames are communicated less successfully than proximate ones, while noting that the magnitude of this difference is estimated with limited precision.
 
 ## H2a. Icon use by spatial distance
 
@@ -292,7 +437,11 @@ h2a_probs <- cell_probs(m_icon)
 show_rope(h2a)
 ```
 
-In the icon model the distance slope is `r round(h2a$m, 2)` log-odds (95% CrI [`r round(h2a$lo, 2)`, `r round(h2a$hi, 2)`], pd = `r round(h2a$pd, 2)`), `r h2a$position`, so H2a is **`r h2a_dec`**. Icon use is `r round(100 * mean(h2a_probs$p[h2a_probs$distance == "displaced"]), 1)`% for displaced targets versus `r round(100 * mean(h2a_probs$p[h2a_probs$distance == "proximate"]), 1)`% for proximate.
+In the icon model the distance slope is `r round(h2a$m, 2)` log-odds (95% CrI [`r round(h2a$lo, 2)`, `r round(h2a$hi, 2)`], pd = `r round(h2a$pd, 3)`), `r h2a$position`. Under the preregistered rule H2a is therefore **`r h2a_dec`**: the lower bound, `r round(h2a$lo, 3)`, falls inside the region of practical equivalence rather than beyond it, by a margin of `r round(ROPE - h2a$lo, 3)` log-odds.
+
+The direction is nonetheless the predicted one and is consistent across the posterior: `r round(100 * h2a$pd, 1)`% of the posterior mass lies above zero, and only `r round(100 * h2a$pct_in_rope, 1)`% falls within the ROPE. On the probability scale, icon use rises from `r round(100 * mean(h2a_probs$p[h2a_probs$distance == "proximate"]), 1)`% for proximate referents to `r round(100 * mean(h2a_probs$p[h2a_probs$distance == "displaced"]), 1)`% for displaced ones. The shift is driven almost entirely by element referents, where icon use rises from 62.5% to 95.0%; for complete frames it is already at 82.5% under proximate presentation and rises only to 95.0%.
+
+What the data determine here is the direction of the effect; what they do not determine is its magnitude. The interval spans 3.38 log-odds, above the 2-log-odds width we preregistered as our precision criterion, and the posterior is only 1.8 times narrower than its prior.
 
 ## H2b. Index use by spatial distance
 
@@ -303,54 +452,185 @@ h2b_probs <- cell_probs(m_index)
 show_rope(h2b)
 ```
 
-In the index model the distance slope is `r round(h2b$m, 2)` log-odds (95% CrI [`r round(h2b$lo, 2)`, `r round(h2b$hi, 2)`], pd = `r round(h2b$pd, 2)`), `r h2b$position`, so H2b is **`r h2b_dec`**. Index use is `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "proximate"]), 1)`% for proximate targets versus `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "displaced"]), 1)`% for displaced.
+In the index model the distance slope is `r round(h2b$m, 2)` log-odds (95% CrI [`r round(h2b$lo, 2)`, `r round(h2b$hi, 2)`], pd = `r round(h2b$pd, 3)`), `r h2b$position`, so H2b is likewise **`r h2b_dec`**; the upper bound, `r round(h2b$hi, 3)`, misses the ROPE boundary of −`r ROPE` by `r round(ROPE + h2b$hi, 3)` log-odds.
+
+As with H2a, the direction is the predicted one and is well determined: `r round(100 * h2b$pd, 1)`% of the posterior lies below zero and `r round(100 * h2b$pct_in_rope, 1)`% falls within the ROPE. Index use falls from `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "proximate"]), 1)`% for proximate referents to `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "displaced"]), 1)`% for displaced ones, and here too the shift is carried by element referents (75.8% to 27.5%) rather than by complete frames (29.2% to 30.0%).
+
+This estimate is the better determined of the two strategy effects: its interval is 1.88 log-odds wide, within our preregistered precision criterion, and the posterior is 3.3 times narrower than its prior. Taken together with H2a, the two models describe the same reciprocal pattern from opposite sides -- displaced referents draw more iconic and fewer indexical strategies -- with each estimate falling just short of the threshold the preregistration set for declaring the effect established.
 
 ## Confirmatory effects against the ROPE
 
-```{r fig_rope, echo=FALSE, fig.align='left', fig.cap=capFig("Confirmatory slope estimates (posterior mean, 95% CrI) against the region of practical equivalence. Shaded band is the primary ROPE (±0.18 log-odds); dashed lines mark the ±0.30 sensitivity bound. H1 is supported when its interval falls entirely left of the band; the H2 no-difference test is supported when the distance-on-success interval falls entirely inside it; H2a is supported to the right of the band and H2b to the left."), fig.height=4, fig.width=8, message=FALSE, warning=FALSE}
-conf_effects <- bind_rows(
-  h1  %>% mutate(param = "H1: size \u2192 success"),
-  h2n %>% mutate(param = "H2: distance \u2192 success"),
-  h2a %>% mutate(param = "H2a: distance \u2192 icon"),
-  h2b %>% mutate(param = "H2b: distance \u2192 index")
+```{r fig_rope, echo=FALSE, fig.align='left', fig.cap=capFig("Confirmatory slope estimates against the region of practical equivalence. Curves are full posterior densities; points and bars are posterior medians with 95% credible intervals. Shaded band is the primary ROPE (±0.18 log-odds); dashed lines mark the ±0.30 sensitivity bound. H1 is supported when its interval falls entirely left of the band; the H2 no-difference test is supported when the distance-on-success interval falls entirely inside it; H2a is supported to the right of the band and H2b to the left."), fig.height=7, fig.width=10, message=FALSE, warning=FALSE}
+rope_draws <- bind_rows(
+  tibble(param = "H1: size \u2192 success",
+         value = posterior::as_draws_df(m_success)$b_sizecompl),
+  tibble(param = "H2: distance \u2192 success",
+         value = posterior::as_draws_df(m_success)$b_distancedispl),
+  tibble(param = "H2a: distance \u2192 icon",
+         value = posterior::as_draws_df(m_icon)$b_distancedispl),
+  tibble(param = "H2b: distance \u2192 index",
+         value = posterior::as_draws_df(m_index)$b_distancedispl)
 ) %>%
   mutate(param = factor(param, levels = rev(c(
     "H1: size \u2192 success", "H2: distance \u2192 success",
     "H2a: distance \u2192 icon", "H2b: distance \u2192 index"))))
 
-ggplot(conf_effects, aes(m, param)) +
+p_rope <- ggplot(rope_draws, aes(x = value, y = param)) +
   annotate("rect", xmin = -ROPE, xmax = ROPE, ymin = -Inf, ymax = Inf,
-           fill = colorBlindBlack8[5], alpha = 0.25) +
+           fill = "grey60", alpha = 0.35) +
   geom_vline(xintercept = c(-ROPE_SENS, ROPE_SENS), linetype = "dashed",
-             colour = "grey60") +
-  geom_vline(xintercept = 0, colour = "grey40") +
-  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+             colour = "grey45", linewidth = 0.5) +
+  geom_vline(xintercept = 0, colour = "grey20", linewidth = 0.6) +
+  ggdist::stat_halfeye(aes(fill = param), .width = 0.95,
+                       point_interval = "median_qi",
+                       slab_alpha = 0.75, slab_colour = "grey25",
+                       slab_linewidth = 0.4, interval_size = 1.4,
+                       point_size = 3.2, height = 0.85) +
+  scale_fill_manual(values = colorBlindBlack8[c(3, 4, 6, 2)], guide = "none") +
+  scale_x_continuous(breaks = seq(-4, 4, 1)) +
   labs(x = "Effect (log-odds)", y = NULL) +
-  theme_minimal()
+  theme_minimal(base_size = 18) +
+  theme(axis.text          = element_text(colour = "black"),
+        axis.text.y        = element_text(face = "bold"),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.y = element_blank(),
+        plot.background    = element_rect(fill = "white", colour = NA),
+        plot.margin        = margin(14, 18, 14, 14))
+
+p_rope
+ggsave(paste0(plots, "fig_rope.png"), p_rope, width = 10, height = 7, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_rope.svg"), p_rope, width = 10, height = 7, bg = "white")
 ```
 
 ## Predicted probabilities across the design
 
-```{r fig_cells, echo=FALSE, fig.align='left', fig.cap=capFig("Model-predicted probabilities across the 2x2 design (population level, 95% CrI): communicative success, icon use, and index use."), fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+```{r fig_cells, echo=FALSE, fig.align='left', fig.cap=capFig("Model-predicted probabilities across the 2x2 design (population level): communicative success, icon use, and index use. Filled points are posterior medians with 95% credible intervals; open diamonds are the observed cell proportions."), fig.height=6.5, fig.width=11, message=FALSE, warning=FALSE}
+obs_cells <- bind_rows(
+  df %>% group_by(size, distance) %>%
+    summarise(obs = mean(correct_target, na.rm = TRUE), .groups = "drop") %>%
+    mutate(outcome = "success"),
+  df %>% group_by(size, distance) %>%
+    summarise(obs = mean(icon), .groups = "drop") %>%
+    mutate(outcome = "icon"),
+  df %>% group_by(size, distance) %>%
+    summarise(obs = mean(index), .groups = "drop") %>%
+    mutate(outcome = "index")
+)
+
 pred_all <- bind_rows(
   h1_probs  %>% mutate(outcome = "success"),
   h2a_probs %>% mutate(outcome = "icon"),
   h2b_probs %>% mutate(outcome = "index")
 ) %>%
-  mutate(outcome = factor(outcome, levels = c("success", "icon", "index")))
+  left_join(obs_cells, by = c("size", "distance", "outcome")) %>%
+  mutate(outcome = factor(outcome, levels = c("success", "icon", "index"),
+                          labels = c("Communicative success", "Icon use", "Index use")))
 
-ggplot(pred_all, aes(distance, p, colour = size, group = size)) +
-  geom_pointrange(aes(ymin = lo, ymax = hi),
-                  position = position_dodge(0.4)) +
-  geom_line(position = position_dodge(0.4)) +
+pd <- position_dodge(0.5)
+p_cells <- ggplot(pred_all, aes(distance, p, colour = size, group = size)) +
+  geom_line(position = pd, linewidth = 1) +
+  geom_linerange(aes(ymin = lo, ymax = hi), position = pd, linewidth = 1.1) +
+  geom_point(position = pd, size = 4) +
+  geom_point(aes(y = obs), position = pd, size = 3.4, shape = 5, stroke = 1.1) +
   facet_wrap(~ outcome) +
   scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
-  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
-  labs(x = "Distance", y = "Predicted probability", colour = "Size") +
-  theme_minimal()
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1),
+                     breaks = seq(0, 1, 0.25)) +
+  labs(x = NULL, y = "Probability", colour = "Referent size") +
+  theme_minimal(base_size = 18) +
+  theme(legend.position  = "bottom",
+        axis.text        = element_text(colour = "black"),
+        strip.text       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        panel.spacing    = grid::unit(1.4, "lines"),
+        plot.background  = element_rect(fill = "white", colour = NA))
+
+p_cells
+ggsave(paste0(plots, "fig_cells.png"), p_cells, width = 11, height = 6.5, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_cells.svg"), p_cells, width = 11, height = 6.5, bg = "white")
 ```
 
-**[PLACEHOLDER — confirmatory synthesis.]** A short paragraph pulling H1, the H2 equivalence test, and H2a/H2b together, to be written once the empirical estimates are in.
+## Communicative success by item
+
+```{r fig_items, echo=FALSE, fig.align='left', fig.cap=capFig("Communicative success by item (30 productions each). Filled points are model-implied posterior medians with 95% credible intervals, including the by-item intercept and marginalising over producer and guesser; open diamonds are the observed proportions correct. Colour encodes referent size, shape encodes spatial distance. Items are ordered by posterior median."), fig.height=9, fig.width=10, message=FALSE, warning=FALSE}
+# one row per item, carrying its design cell; strategy covariates at the midpoint
+item_grid <- df %>%
+  distinct(item, story_id, target, size, distance) %>%
+  mutate(icon_c = 0, index_c = 0)
+
+# re_formula keeps the by-item intercept but drops producer and guesser
+item_post <- item_grid %>%
+  add_epred_draws(m_success, re_formula = ~ (1 | item)) %>%
+  group_by(item, story_id, target, size, distance) %>%
+  summarise(p  = median(.epred),
+            lo = quantile(.epred, 0.025),
+            hi = quantile(.epred, 0.975), .groups = "drop")
+
+item_raw <- df %>%
+  group_by(story_id) %>%
+  summarise(obs = mean(correct_target, na.rm = TRUE),
+            n = n(), .groups = "drop")
+
+item_tbl <- item_post %>%
+  left_join(item_raw, by = "story_id") %>%
+  mutate(target = fct_reorder(target, p))
+
+p_items <- ggplot(item_tbl, aes(p, target, colour = size, shape = distance)) +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 1, alpha = 0.85) +
+  geom_point(size = 4) +
+  geom_point(aes(x = obs), shape = 5, size = 3.4, stroke = 1.1) +
+  scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
+  scale_shape_manual(values = c(proximate = 16, displaced = 17)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1),
+                     breaks = seq(0, 1, 0.25)) +
+  labs(x = "P(correct)", y = NULL,
+       colour = "Referent size", shape = "Spatial distance",
+       caption = "Open diamonds = observed proportion correct") +
+  theme_minimal(base_size = 17) +
+  theme(legend.position    = "bottom",
+        legend.box         = "vertical",
+        axis.text          = element_text(colour = "black"),
+        axis.text.y        = element_text(face = "bold"),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey92"),
+        plot.caption       = element_text(hjust = 0),
+        plot.background    = element_rect(fill = "white", colour = NA))
+
+p_items
+ggsave(paste0(plots, "fig_items.png"), p_items, width = 10, height = 9, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_items.svg"), p_items, width = 10, height = 9, bg = "white")
+```
+
+```{r tab_items, echo=TRUE, message=FALSE, warning=FALSE}
+item_shrink <- item_tbl %>%
+  mutate(shrinkage = round(100 * (obs - p), 1),
+         across(c(p, obs), ~ round(100 * .x, 1))) %>%
+  select(target, story_id, size, distance, n, observed = obs, fitted = p, shrinkage) %>%
+  arrange(desc(abs(shrinkage)))
+
+knitr::kable(item_shrink, row.names = FALSE,
+  caption = capTab("Observed and model-implied success rates per item, ordered by the size of the shrinkage toward the design cell. Positive shrinkage means the raw proportion exceeds the model estimate."))
+```
+
+The by-item random intercept allows communicative success to vary across the 16 stimuli beyond what referent size and spatial distance predict, and the variation it captures is substantial. Model-implied success rates span from 8.4% for *house* to 93.8% for *painting* -- a range considerably wider than the 32-point gap between the two levels of referent size.
+
+Model estimates track the raw proportions closely. The median absolute difference between observed and fitted rates is 2.5 percentage points, and only one item shifts by more than 8 points. This is the expected behavior of partial pooling with 30 observations per item: estimates are drawn slightly toward the mean of their design cell, but the data dominate. The figure plots both, so the degree of pooling is visible rather than hidden.
+
+Two items depart from their design cell in ways worth noting. *Mountains*, a complete displaced referent, is understood 63.3% of the time -- roughly twice the rate of the other items in its cell, and comparable to element referents. *House*, in the same cell, is the hardest item in the set at 6.7%. Both are complete spatial frames presented as displaced, so the manipulation cannot explain the difference between them. A plausible reading is that some complete frames have a depictable external form -- a mountain range has a distinctive silhouette that can be traced iconically -- whereas others are defined by their interior and have no comparable outline, leaving a producer with little to depict. We advance this as an observation rather than a tested claim: item identity was not manipulated, and the by-item intercept was included to absorb this variation, not to explain it.
+
+The practical consequence is that treating the 16 stimuli as interchangeable tokens of their conditions would misstate the precision of the condition effects. Including the by-item intercept means the effects we report are estimated over stimulus variability rather than conditional on this particular set of 16 items.
+
+## Confirmatory summary
+
+The three confirmatory results converge on a single pattern: **complete spatial frames are hard to communicate no matter where they are, while elements are easy when nearby and hard when displaced.**
+
+Referent size is the dominant effect. Complete frames are understood about 32% less often than elements, and this holds under every bound and every prior specification we examined. Spatial distance also matters, contrary to the equivalence we predicted: displaced referents are understood less often than proximate ones. But the two factors are not additive, and the predicted probabilities show why.
+
+For **element** referents, displacement is costly: success falls from 84.5% to 40.9%, and producers change what they do -- iconic representation rises from 62.5% to 95.0% while pointing falls from 75.8% to 27.5%. For **complete** frames, displacement changes very little: success falls only from 30.0% to 20.8%, and strategy barely moves (icon 82.5% to 95.0%, index 29.2% to 30.0%). Producers representing a complete frame have already adopted the displaced-style strategy even when the referent is right in front of them.
+
+The interpretation we favor is that a complete spatial frame cannot be pointed at. An element can be indicated directly when it is present, which is why pointing dominates the element-proximate cell and why that cell has by far the highest success rate. A whole room, street or landscape has no single location to indicate, so producers must depict it iconically regardless of where it is -- and depiction is harder for a guesser to resolve than pointing. Displacement then removes the pointing option for elements too, pushing them toward the same iconic strategy and the same lower success rate. On this reading, size and distance are not two independent difficulties but two routes to the same one: the loss of a directly indicable target.
+
+We report the interaction coefficients themselves without interpretation, as they are the least precisely estimated parameters in the analysis. The pattern they describe, however, is consistent across all three outcomes and visible in the raw cell means as well as the model-implied ones.
 
 ## Robustness
 
@@ -362,7 +642,9 @@ h1_tot_dec <- rope_decision(h1_tot, "below")
 show_rope(h1_tot)
 ```
 
-Dropping the strategy covariates, the total size effect is `r round(h1_tot$m, 2)` log-odds (95% CrI [`r round(h1_tot$lo, 2)`, `r round(h1_tot$hi, 2)`], pd = `r round(h1_tot$pd, 2)`), `r h1_tot$position` (H1 **`r h1_tot_dec`**), against `r round(h1$m, 2)` in the adjusted model — the size effect `r if (abs(h1_tot$m - h1$m) < 0.1) "is essentially unchanged" else "shifts"` when strategy is not conditioned on.
+Dropping the strategy covariates, the total size effect is `r round(h1_tot$m, 2)` log-odds (95% CrI [`r round(h1_tot$lo, 2)`, `r round(h1_tot$hi, 2)`], pd = `r round(h1_tot$pd, 3)`), `r h1_tot$position` and `r h1_tot$position_sens` at the sensitivity bound, so H1 is **`r h1_tot_dec`** under this specification as well.
+
+The total effect is indistinguishable from the adjusted estimate of `r round(h1$m, 2)`: the two posterior medians agree to two decimal places and the credible intervals differ by 0.01 log-odds at one bound. Conditioning on representational strategy therefore neither absorbs nor inflates the effect of referent size on communicative success. Substantively, this means the size effect does not operate *through* strategy selection -- complete spatial frames are not harder to communicate merely because they elicit different strategies. Whatever makes them harder is not captured by whether the producer used an icon or an index.
 
 ### Registered single-binary Model A
 
@@ -374,7 +656,55 @@ regA_dec <- rope_decision(regA, "below")
 show_rope(regA)
 ```
 
-On the subset coded as exactly one of icon or index (`r nrow(m_repstrat_registered$data)` productions), the registered single-coefficient distance effect is `r round(regA$m, 2)` log-odds (95% CrI [`r round(regA$lo, 2)`, `r round(regA$hi, 2)`], pd = `r round(regA$pd, 2)`), `r regA$position`. Read in the registered direction (displaced → more icon, hence fewer index responses) this is **`r regA_dec`**, and it is reported alongside the two-model result as the preregistered check where the icon-or-index assumption holds.
+On the subset coded as exactly one of icon or index (`r nrow(m_repstrat_registered$data)` of `r nrow(df)` productions), the registered single-coefficient distance effect is `r round(regA$m, 2)` log-odds (95% CrI [`r round(regA$lo, 2)`, `r round(regA$hi, 2)`], pd = `r round(regA$pd, 3)`), `r regA$position`. Read in the registered direction -- displaced referents eliciting more iconic and hence fewer indexical responses -- this is **`r regA_dec`**.
+
+This is the least precise estimate in the analysis. Its interval spans 4.07 log-odds, twice the width we preregistered as our precision criterion, and only `r round(100 * regA$pd, 1)`% of the posterior lies below zero, against `r round(100 * h2a$pd, 1)`% and `r round(100 * h2b$pd, 1)`% for the two split models. The reason is structural rather than statistical: the single-binary coding requires each production to be either iconic or indexical, so it excludes the 125 productions on which both strategies co-occurred and the 40 on which neither was coded -- 165 of 480 trials, or 34% of the data.
+
+The exclusion is not random with respect to the design. Co-occurrence is itself patterned by condition, so the subset that survives single-binary coding is not a representative sample of the full dataset. We therefore report the two split Bernoulli models as our primary evidence on strategy selection and this model as the preregistered check, noting that its direction agrees with both split models while its precision is substantially lower. The discrepancy reflects the coding assumption, not a disagreement about what producers did.
+
+*Variability between producers, guessers and items*
+
+```{r fig_re_sd, echo=FALSE, fig.align='left', fig.cap=capFig("Random-effect standard deviations from Model B (posterior densities, medians and 95% CrI). Larger values indicate greater variability between producers, guessers or items in the corresponding parameter."), fig.height=6.5, fig.width=9, message=FALSE, warning=FALSE}
+sd_draws <- posterior::as_draws_df(m_success) %>%
+  select(starts_with("sd_")) %>%
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  mutate(group = case_when(str_detect(param, "producer") ~ "Producer",
+                           str_detect(param, "guesser")  ~ "Guesser",
+                           TRUE                          ~ "Item"),
+         term = str_remove(param, "^sd_[a-z]+__") %>%
+           recode(Intercept = "Intercept", sizecompl = "Size",
+                  distancedispl = "Distance",
+                  `sizecompl:distancedispl` = "Size x Distance"),
+         term = factor(term, levels = rev(c("Intercept", "Size", "Distance",
+                                            "Size x Distance"))))
+
+p_sd <- ggplot(sd_draws, aes(value, term, fill = group)) +
+  ggdist::stat_halfeye(.width = 0.95, point_interval = "median_qi",
+                       slab_alpha = 0.75, slab_colour = "grey25",
+                       slab_linewidth = 0.3, height = 0.85) +
+  facet_wrap(~ group) +
+  scale_fill_manual(values = colorBlindBlack8[c(3, 4, 7)], guide = "none") +
+  labs(x = "SD (log-odds)", y = NULL) +
+  theme_minimal(base_size = 17) +
+  theme(axis.text = element_text(colour = "black"),
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "white", colour = NA))
+
+p_sd
+ggsave(paste0(plots, "fig_re_sd.png"), p_sd, width = 9, height = 6.5, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_re_sd.svg"), p_sd, width = 9, height = 6.5, bg = "white")
+```
+
+The registered models include by-producer and by-guesser random effects for the intercept and all condition slopes, and a by-item random intercept. Their posteriors differ sharply in how well the data identify them.
+
+The by-item standard deviation is the only variance component clearly separated from zero: 0.91 log-odds (95% CrI [0.52, 1.60]). Its lower bound exceeds the posterior median of every other component in the model. This is the item-level variation shown above, where model-implied success ranged from 8.4% for *house* to 93.8% for *painting*. Which referent a producer must convey matters more for communicative success than who is conveying it or who is interpreting it.
+
+The by-producer and by-guesser components are all small and imprecisely estimated, with medians between 0.23 and 0.50 and lower bounds at 0.01-0.02 in every case. Producer and guesser estimates are near-identical throughout (intercept 0.40 and 0.39; size 0.23 and 0.23; distance 0.33 and 0.33; interaction 0.50 and 0.50), which is unsurprising given that roles alternated within dyads, so the same individuals contribute in both capacities. The data provide no basis for distinguishing variability in production from variability in comprehension.
+
+We do not interpret the ordering among these four components. Although the size-by-distance term has the largest median (0.50), it also has by far the widest interval ([0.02, 1.95] against [0.02, 0.94] for the intercept), so its higher central estimate reflects a heavier upper tail rather than better-resolved variation. What the data support is the general statement that between-dyad variability is modest relative to between-item variability.
+
+With 30 dyads these variance components are estimated with limited precision, and posteriors concentrated near zero are consistent both with genuinely small variability and with insufficient data to resolve it. We report the random-effects structure as registered and draw no inference from the apparent absence of by-dyad variation.
 
 # Exploratory results (post hoc)
 
@@ -389,7 +719,11 @@ prop_probs <- cell_probs(m_prop)
 bind_rows(show_rope(prop_size), show_rope(prop_dist))
 ```
 
-Prop use has a distance slope of `r round(prop_dist$m, 2)` log-odds (95% CrI [`r round(prop_dist$lo, 2)`, `r round(prop_dist$hi, 2)`], pd = `r round(prop_dist$pd, 2)`) and a size slope of `r round(prop_size$m, 2)` (95% CrI [`r round(prop_size$lo, 2)`, `r round(prop_size$hi, 2)`], pd = `r round(prop_size$pd, 2)`). **[PLACEHOLDER]** Interpretation of what, if anything, drives the unregistered third strategy, once the empirical rates are in.
+Prop use -- the third strategy, not part of the registered analysis -- is strongly patterned by referent size: `r round(prop_size$m, 2)` log-odds (95% CrI [`r round(prop_size$lo, 2)`, `r round(prop_size$hi, 2)`], pd = `r round(prop_size$pd, 3)`), with `r round(100 * prop_size$pd, 1)`% of the posterior below zero. Producers use props far less often for complete spatial frames than for elements, and the raw rates make the size of the difference plain: 56.3% and 17.5% for proximate and displaced elements, against 2.5% and 1.7% for the corresponding complete frames. Prop use is effectively absent from the complete conditions.
+
+The distance effect is weaker and less certain, `r round(prop_dist$m, 2)` log-odds (95% CrI [`r round(prop_dist$lo, 2)`, `r round(prop_dist$hi, 2)`], pd = `r round(prop_dist$pd, 3)`), and both intervals straddle the equivalence region. Neither is offered as a tested effect: this model was not preregistered and both estimates are imprecise.
+
+The pattern is nonetheless coherent with the account we give for the registered effects. A prop is a physical object recruited to stand in for a referent, and that substitution works when the referent is itself a discrete object of comparable scale. There is no available object that can stand in for a room, a city or a landscape, so producers representing complete spatial frames have no prop strategy to fall back on -- a further respect in which complete frames narrow the producer's options.
 
 ## Icon-index co-occurrence
 
@@ -401,16 +735,61 @@ both_probs <- cell_probs(m_both)
 bind_rows(show_rope(both_size), show_rope(both_dist), show_rope(both_int))
 ```
 
-The probability of layering icon and index together has a distance slope of `r round(both_dist$m, 2)` (pd = `r round(both_dist$pd, 2)`), a size slope of `r round(both_size$m, 2)` (pd = `r round(both_size$pd, 2)`), and a size × distance interaction of `r round(both_int$m, 2)` (pd = `r round(both_int$pd, 2)`). **[PLACEHOLDER]** Whether co-occurrence concentrates in particular cells, read against the categorical model below.
+The probability of layering icon and index together shows no clear condition effect. The size slope is `r round(both_size$m, 2)` (95% CrI [`r round(both_size$lo, 2)`, `r round(both_size$hi, 2)`], pd = `r round(both_size$pd, 3)`), the distance slope `r round(both_dist$m, 2)` (95% CrI [`r round(both_dist$lo, 2)`, `r round(both_dist$hi, 2)`], pd = `r round(both_dist$pd, 3)`), and the interaction `r round(both_int$m, 2)` (95% CrI [`r round(both_int$lo, 2)`, `r round(both_int$hi, 2)`], pd = `r round(both_int$pd, 3)`). All three intervals straddle the equivalence region, and for the distance slope and the interaction the posterior is barely displaced from zero at all (pd = `r round(both_dist$pd, 2)` and `r round(both_int$pd, 2)`, where 0.50 would indicate no directional information whatsoever).
 
-```{r fig_both, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted probability of icon-index co-occurrence across the 2x2 design (population level, 95% CrI)."), fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
-ggplot(both_probs, aes(distance, p, colour = size, group = size)) +
-  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(0.4)) +
-  geom_line(position = position_dodge(0.4)) +
+The substantive point is not the coefficients but the base rate. Co-occurrence runs at 15-27% in every cell of the design: producers layer the two strategies roughly a fifth of the time regardless of what they are representing. Icon and index are not competing alternatives that producers choose between, and the absence of condition effects here is itself informative -- layering appears to be a general feature of whole-body representation rather than a response to a particular kind of referent.
+
+```{r fig_both, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted probability of icon-index co-occurrence across the 2x2 design (population level, 95% CrI)."), fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+pd_b <- position_dodge(0.4)
+p_both <- ggplot(both_probs, aes(distance, p, colour = size, group = size)) +
+  geom_line(position = pd_b, linewidth = 1) +
+  geom_linerange(aes(ymin = lo, ymax = hi), position = pd_b, linewidth = 1.1) +
+  geom_point(position = pd_b, size = 4) +
   scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
-  scale_y_continuous(labels = scales::percent) +
-  labs(x = "Distance", y = "P(icon & index)", colour = "Size") +
-  theme_minimal()
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.7),
+                     breaks = seq(0, 0.7, 0.1)) +
+  labs(x = NULL, y = "P(icon and index)", colour = "Referent size") +
+  theme_minimal(base_size = 18) +
+  theme(legend.position  = "bottom",
+        axis.text        = element_text(colour = "black"),
+        panel.grid.minor = element_blank(),
+        plot.background  = element_rect(fill = "white", colour = NA))
+
+p_both
+ggsave(paste0(plots, "fig_both.png"), p_both, width = 8, height = 6, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_both.svg"), p_both, width = 8, height = 6, bg = "white")
+```
+
+```{r fig_strategy_success, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted communicative success by strategy use (population level, 95% CrI), holding the other strategy at the midpoint of its coding. Both strategies are associated with higher success; the association is better determined for index than for icon."), fig.height=6, fig.width=9, message=FALSE, warning=FALSE}
+strat_grid <- expand_grid(
+  design_grid %>% distinct(size, distance),
+  tibble(icon_c = c(-0.5, 0.5, 0, 0), index_c = c(0, 0, -0.5, 0.5),
+         strategy = c("icon", "icon", "index", "index"),
+         used = c("not used", "used", "not used", "used"))
+)
+
+strat_probs <- strat_grid %>%
+  add_epred_draws(m_success, re_formula = NA) %>%
+  group_by(strategy, used) %>%
+  summarise(p = median(.epred), lo = quantile(.epred, 0.025),
+            hi = quantile(.epred, 0.975), .groups = "drop")
+
+p_strat <- ggplot(strat_probs, aes(used, p, colour = strategy, group = strategy)) +
+  geom_line(linewidth = 1) +
+  geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 1.1) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = colorBlindBlack8[c(2, 3)]) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = NULL, y = "P(correct)", colour = "Strategy") +
+  theme_minimal(base_size = 18) +
+  theme(legend.position = "bottom",
+        axis.text = element_text(colour = "black"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "white", colour = NA))
+
+p_strat
+ggsave(paste0(plots, "fig_strategy_success.png"), p_strat, width = 9, height = 6, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_strategy_success.svg"), p_strat, width = 9, height = 6, bg = "white")
 ```
 
 ## Four-way configuration
@@ -420,26 +799,76 @@ combo_probs <- cell_probs_cat(m_combo)
 combo_probs
 ```
 
-**[PLACEHOLDER]** Reading of how the four configurations (`neither / icon_only / index_only / both`) redistribute across the design, relative to the `neither` reference. Recall that `neither` includes prop-only productions.
+The categorical model partitions each production into one of four configurations and shows how the whole distribution shifts across the design. Estimates are reported against `icon_only` as the reference category; `neither` could not serve as the reference because it does not occur in the element-proximate cell.
 
-```{r fig_combo, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted probability of each icon x index configuration across the 2x2 design (population level, stacked posterior means)."), fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
-ggplot(combo_probs, aes(distance, p, fill = .category)) +
-  geom_col(width = 0.65, alpha = 0.9) +
+Two patterns stand out. First, `index_only` collapses almost entirely outside the element-proximate cell: it accounts for 27.9% of productions there, but only 3.8% for displaced elements, 1.1% for proximate complete frames and 0.8% for displaced complete frames. Pure pointing is viable for a nearby element and essentially unavailable everywhere else. Second, `icon_only` rises correspondingly, from 44.6% in element-proximate to between 51.8% and 73.5% in the other three cells, while `both` holds steady at roughly a fifth to a third throughout.
+
+The `neither` category is concentrated in the complete conditions -- 13.0% for proximate complete frames and 5.9% for displaced, against under 1% for both element cells. Because prop use is close to zero in these conditions, most of these productions were not coded for any of the three strategies. This is worth reporting as a finding about the coding scheme: our three categories do not exhaust what producers do when representing a complete spatial frame at close range.
+
+We do not interpret the model's interaction terms. `index_only` is observed on only 2 and 3 trials in the two complete cells and `neither` is absent from element-proximate, so those contrasts are constrained by the prior rather than by the data. The cell probabilities above, which the posterior-predictive checks confirm the model reproduces, are the appropriate basis for reading this result.
+
+```{r fig_combo, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted probability of each icon x index configuration across the 2x2 design (population level, stacked posterior means). Means are stacked rather than medians so the four configurations sum to 100%; the table above reports medians."), fig.height=6.5, fig.width=10, message=FALSE, warning=FALSE}
+combo_stack <- design_grid %>%
+  add_epred_draws(m_combo, re_formula = NA) %>%
+  group_by(size, distance, .category) %>%
+  summarise(p = mean(.epred), .groups = "drop") %>%
+  mutate(.category = factor(.category,
+                            levels = c("icon_only", "both", "index_only", "neither"),
+                            labels = c("icon only", "icon + index", "index only", "neither")),
+         size = factor(size, levels = c("element", "complete"),
+                       labels = c("Element", "Complete")),
+         distance = factor(distance, levels = c("proximate", "displaced"),
+                           labels = c("Proximate", "Displaced")))
+
+p_combo <- ggplot(combo_stack, aes(distance, p, fill = .category)) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = ifelse(p >= 0.05, scales::percent(p, accuracy = 1), "")),
+            position = position_stack(vjust = 0.5), size = 5, colour = "grey15") +
   facet_wrap(~ size) +
-  scale_fill_manual(values = colorBlindBlack8[c(1, 2, 3, 6)]) +
-  scale_y_continuous(labels = scales::percent) +
-  labs(x = "Distance", y = "Predicted probability", fill = "Configuration") +
-  theme_minimal()
+  scale_fill_manual(values = colorBlindBlack8[c(2, 3, 4, 8)]) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Predicted probability", fill = "Configuration") +
+  theme_minimal(base_size = 18) +
+  theme(legend.position    = "bottom",
+        axis.text          = element_text(colour = "black"),
+        strip.text         = element_text(face = "bold"),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.spacing      = grid::unit(1.4, "lines"),
+        plot.background    = element_rect(fill = "white", colour = NA))
+
+p_combo
+ggsave(paste0(plots, "fig_combo.png"), p_combo, width = 10, height = 6.5, dpi = 600, bg = "white")
+ggsave(paste0(plots, "fig_combo.svg"), p_combo, width = 10, height = 6.5, bg = "white")
 ```
+
 
 # Optional: ROPE cross-check with bayestestR
 
 A cross-check that the manual ROPE decisions match `bayestestR` on the same bounds and interval; not part of the report.
 
 ```{r rope_crosscheck, echo=TRUE, message=FALSE, warning=FALSE}
-bayestestR::rope(m_success, range = c(-ROPE, ROPE), ci = 0.95,
-                 parameters = "b_sizecompl")
+# Independent check on the manual ROPE implementation. bayestestR restricts to
+# the credible interval by default; ci = 1 uses the full posterior, matching the
+# pct_in_rope column reported above.
+purrr::walk2(
+  list(m_success, m_success, m_icon, m_index),
+  c("^b_sizecompl$", "^b_distancedispl$", "^b_distancedispl$", "^b_distancedispl$"),
+  ~ print(bayestestR::rope(.x, range = c(-ROPE, ROPE), ci = 1, parameters = .y))
+)
+
+# The decision itself, for all four registered effects.
+bayestestR::equivalence_test(m_success, range = c(-ROPE, ROPE), ci = 0.95,
+                             parameters = "^b_(sizecompl|distancedispl)$")
+bayestestR::equivalence_test(m_icon, range = c(-ROPE, ROPE), ci = 0.95,
+                             parameters = "^b_distancedispl$")
+bayestestR::equivalence_test(m_index, range = c(-ROPE, ROPE), ci = 0.95,
+                             parameters = "^b_distancedispl$")
 ```
+
+As an independent check on the manual implementation, `bayestestR` returns the same classification for every registered effect. The two effects on communicative success reject practical equivalence (size and distance, 95% HDI [-2.78, -0.68] and [-2.35, -0.20]), and the two strategy effects are undecided (icon [0.07, 3.45], index [-1.97, -0.09]), matching the decisions reported above. The proportion of the posterior inside the ROPE agrees to the second decimal in all four cases (0.29%, 1.75%, 1.70% and 2.86% against our 0.3%, 1.8%, 1.7% and 2.9%). Because `bayestestR` reports highest-density intervals where we report equal-tailed intervals, the agreement of all four intervals to two decimal places also confirms that these posteriors are close to symmetric.
+
+Note that `bayestestR::rope()` restricts the calculation to the credible interval by default, whereas we report the proportion over the full posterior; the values above use `ci = 1` so that the two are directly comparable.
 
 # Session info
 

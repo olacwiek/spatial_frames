@@ -94,6 +94,27 @@ options(mc.cores = parallel::detectCores())
 # If cmdstanr is installed it is faster; uncomment to use it globally.
 # options(brms.backend = "cmdstanr")
 
+colorBlindBlack8  <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+                       "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+
+# Figure and Table caption helpers (manual numbering for HTML):
+outputFormat = opts_knit$get("rmarkdown.pandoc.to");
+if( is.null(outputFormat) ) outputFormat = "";
+capTabNo = 1; capFigNo = 1;
+capTab = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Table ",capTabNo,".** ",x,"")
+    capTabNo <<- capTabNo + 1
+  }; x
+}
+capFig = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Figure ",capFigNo,".** ",x,"")
+    capFigNo <<- capFigNo + 1
+  }; x
+}
+
 ######## refit switch ########
 # FALSE = load cached fits from models/ when present (fast re-knit).
 # TRUE  = ignore the cache and refit everything. Turn ON when the real
@@ -220,6 +241,39 @@ get_model <- function(tag, fit_fun) {
 }
 ```
 
+Priors for `m_combo`
+
+```{r}
+#################### reference level: icon_only (modal, in all four cells) #####
+# 'neither' cannot be the reference: element-proximate x neither = 0.
+df <- df %>%
+  mutate(strategy_combo = factor(strategy_combo,
+                                 levels = c("icon_only", "index_only", "both", "neither")))
+
+f_combo <- bf(strategy_combo ~ size * distance +
+                (1 | producer) + (1 | guesser) + (1 | item))
+
+#################### priors: one set per non-reference category ################
+# categorical() builds one linear predictor per non-reference level, named
+# mu<level> with non-alphanumeric characters stripped (index_only -> muindexonly).
+# Derived from the model rather than typed, so re-levelling or renaming cannot
+# silently desynchronise them.
+combo_dpars <- brms::default_prior(f_combo, data = df, family = categorical())$dpar
+combo_dpars <- setdiff(unique(combo_dpars[!is.na(combo_dpars)]), "")
+combo_dpars   # expect: "muboth" "muindexonly" "muneither"
+
+priors_combo <- do.call(c, lapply(combo_dpars, function(dp) c(
+  set_prior("normal(0, 1.5)", class = "b",         dpar = dp),
+  set_prior("normal(0, 2)",   class = "Intercept", dpar = dp),
+  set_prior("exponential(1)", class = "sd",        dpar = dp)
+)))
+
+vp <- brms::validate_prior(priors_combo, formula = f_combo, data = df,
+                           family = categorical())
+# must return zero rows: nothing in b / Intercept / sd still on a brms default
+vp[vp$class %in% c("b", "Intercept", "sd") & vp$source == "default", ]
+```
+
 # Model fitting
 
 ## Confirmatory models
@@ -269,20 +323,272 @@ m_prop <- get_model("m_prop", function()
 m_both <- get_model("m_both", function()
   fit_ladder("both", "size * distance", df))
 
-# four-way configuration (neither / icon_only / index_only / both), reference = neither
+# four-way configuration (icon_only [ref] / index_only / both / neither)
 m_combo <- get_model("m_combo", function()
   brm(
-    formula = strategy_combo ~ size * distance +
-      (1 | producer) + (1 | guesser) + (1 | item),
-    data = df, family = categorical(),
-    prior = priors_base,
-    chains = 4, iter = 10000, warmup = 4000, seed = 2137,
-    control = list(adapt_delta = 0.95, max_treedepth = 12),
+    formula = f_combo, data = df, family = categorical(),
+    prior = priors_combo,
+    chains = 4, iter = 16000, warmup = 8000, seed = 2137,
+    control = list(adapt_delta = 0.99, max_treedepth = 12),
     refresh = 0
   ))
 
 models_exploratory <- list(prop = m_prop, both = m_both, combo = m_combo)
 ```
+
+
+# Prior sensitivity analysis
+
+```{r}
+#################### two supplementary prior sets ##############################
+priors_tight_base <- c(
+  set_prior("normal(0, 0.75)", class = "b"),
+  set_prior("normal(0, 1.5)",  class = "Intercept"),
+  set_prior("exponential(2)",  class = "sd")
+)
+priors_tight_cor <- c(priors_tight_base, set_prior("lkj(4)", class = "cor"))
+
+priors_wide_base <- c(
+  set_prior("normal(0, 3)",     class = "b"),
+  set_prior("normal(0, 4)",     class = "Intercept"),
+  set_prior("exponential(0.5)", class = "sd")
+)
+priors_wide_cor <- c(priors_wide_base, set_prior("lkj(1)", class = "cor"))
+
+#################### refit holding the RE structure fixed ######################
+# update() reuses the fitted model's formula, data and family, so ONLY the prior
+# changes. Re-running fit_ladder() would let the selected RE level differ between
+# arms and confound prior with random-effects structure. Sampler settings match
+# the registered fits exactly (10000/4000) so the arms differ in prior alone.
+refit_priors <- function(fit, pr_base, pr_cor) {
+  has_cor <- any(brms::prior_summary(fit)$class == "cor")
+  update(fit,
+         prior   = if (has_cor) pr_cor else pr_base,
+         chains  = 4, iter = 10000, warmup = 4000, seed = 2137,
+         control = list(adapt_delta = 0.95, max_treedepth = 12),
+         refresh = 0)
+}
+
+# m_combo is excluded (exploratory, no ROPE decision, dpar-addressed priors);
+# m_success_nostrat is excluded (already a robustness check).
+models_registered <- list(
+  icon                = m_icon,
+  index               = m_index,
+  success             = m_success,
+  repstrat_registered = m_repstrat_registered
+)
+
+models_tight <- lapply(names(models_registered), function(nm)
+  get_model(paste0("m_", nm, "_tight"),
+            function() refit_priors(models_registered[[nm]],
+                                    priors_tight_base, priors_tight_cor)))
+names(models_tight) <- names(models_registered)
+
+models_wide <- lapply(names(models_registered), function(nm)
+  get_model(paste0("m_", nm, "_wide"),
+            function() refit_priors(models_registered[[nm]],
+                                    priors_wide_base, priors_wide_cor)))
+names(models_wide) <- names(models_registered)
+```
+
+```{r}
+rope_r <- 0.18   # preregistered primary ROPE; rerun with 0.30 for the sensitivity bound
+
+rope_verdict <- function(lo, hi, r = rope_r) {
+  dplyr::case_when(
+    lo >   r           ~ "above ROPE",
+    hi <  -r           ~ "below ROPE",
+    lo >= -r & hi <= r ~ "within ROPE",
+    TRUE               ~ "inconclusive"
+  )
+}
+
+coef_summary <- function(fit, model, arm) {
+  dr   <- posterior::as_draws_df(fit)
+  vars <- posterior::variables(dr)
+  vars <- vars[grepl("^b_", vars) & !grepl("Intercept", vars)]
+
+  dplyr::bind_rows(lapply(vars, function(v) {
+    x  <- dr[[v]]
+    qs <- unname(stats::quantile(x, c(0.025, 0.975)))
+    tibble::tibble(
+      model   = model,
+      arm     = arm,
+      term    = v,
+      med     = round(stats::median(x), 3),
+      lo      = round(qs[1], 3),
+      hi      = round(qs[2], 3),
+      verdict = rope_verdict(qs[1], qs[2])   # unrounded bounds, deliberately
+    )
+  }))
+}
+
+sens_tbl <- dplyr::bind_rows(
+  dplyr::bind_rows(purrr::imap(models_registered, ~ coef_summary(.x, .y, "registered"))),
+  dplyr::bind_rows(purrr::imap(models_tight,      ~ coef_summary(.x, .y, "tight"))),
+  dplyr::bind_rows(purrr::imap(models_wide,       ~ coef_summary(.x, .y, "wide")))
+)
+
+sens_wide <- sens_tbl %>%
+  tidyr::pivot_wider(id_cols = c(model, term), names_from = arm,
+                     values_from = c(med, lo, hi, verdict)) %>%
+  dplyr::mutate(
+    shift_tight    = round(med_tight - med_registered, 3),
+    shift_wide     = round(med_wide  - med_registered, 3),
+    width_reg      = round(hi_registered - lo_registered, 3),
+    decision_holds = verdict_tight == verdict_registered &
+                     verdict_wide  == verdict_registered
+  ) %>%
+  dplyr::arrange(model, term)
+
+#################### convergence of the supplementary fits #####################
+sens_convergence <- dplyr::bind_rows(
+  dplyr::bind_rows(purrr::imap(models_tight,
+    ~ dplyr::mutate(fit_diagnostics(.x), model = .y, arm = "tight"))),
+  dplyr::bind_rows(purrr::imap(models_wide,
+    ~ dplyr::mutate(fit_diagnostics(.x), model = .y, arm = "wide")))
+) %>% dplyr::relocate(model, arm)
+
+sens_convergence
+
+knitr::kable(sens_wide, row.names = FALSE,
+  caption = capTab(sprintf(
+    "Prior sensitivity. Registered priors vs. tighter (b ~ N(0, 0.75), Intercept ~ N(0, 1.5), sd ~ Exp(2), cor ~ LKJ(4)) and wider (b ~ N(0, 3), Intercept ~ N(0, 4), sd ~ Exp(0.5), cor ~ LKJ(1)) sets. Random-effects structure held fixed at the level selected under the registered priors. ROPE = +/-%.2f log-odds; decision_holds is FALSE wherever a verdict changes.", rope_r)))
+
+if (all(sens_wide$decision_holds)) {
+  message("All ROPE decisions unchanged across both prior arms.")
+} else {
+  message("Decisions change for: ",
+          paste(with(dplyr::filter(sens_wide, !decision_holds),
+                     paste0(model, ":", term)), collapse = ", "))
+}
+
+#################### save small artefacts for the laptop #######################
+if (!exists("output")) output <- paste0(parentfolder, "/output/")
+dir.create(output, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(sens_wide,        paste0(output, "sens_wide.rds"))
+saveRDS(sens_tbl,         paste0(output, "sens_tbl.rds"))
+saveRDS(sens_convergence, paste0(output, "sens_convergence.rds"))
+saveRDS(
+  lapply(c(models_registered, models_exploratory),
+         function(f) posterior::summarise_draws(posterior::as_draws_df(f))),
+  paste0(output, "posterior_summaries.rds")
+)
+```
+
+```{r echo=TRUE}
+# Prior-vs-posterior for the registered fixed effects. sample_prior = "only"
+# gives draws from the prior on the SAME model, so the two are directly
+# comparable. Cached because it refits.
+prior_draws_for <- function(fit, tag) {
+  get_model(paste0(tag, "_prioronly"), function()
+    update(fit, sample_prior = "only",
+           chains = 2, iter = 4000, warmup = 2000, seed = 2137, refresh = 0))
+}
+
+pp_compare <- function(fit, tag, model_label) {
+  pri <- posterior::as_draws_df(prior_draws_for(fit, tag))
+  pos <- posterior::as_draws_df(fit)
+  vs  <- grep("^b_", posterior::variables(pos), value = TRUE)
+  vs  <- vs[!grepl("Intercept", vs)]
+  dplyr::bind_rows(
+    tidyr::pivot_longer(pri[, vs], everything(), names_to = "term", values_to = "value") %>%
+      dplyr::mutate(source = "prior"),
+    tidyr::pivot_longer(pos[, vs], everything(), names_to = "term", values_to = "value") %>%
+      dplyr::mutate(source = "posterior")
+  ) %>% dplyr::mutate(model = model_label)
+}
+
+pp_df <- dplyr::bind_rows(
+  pp_compare(m_icon,    "m_icon",    "icon use"),
+  pp_compare(m_index,   "m_index",   "index use"),
+  pp_compare(m_success, "m_success", "success")
+) %>%
+  dplyr::mutate(source = factor(source, levels = c("prior", "posterior")))
+
+p_pp <- ggplot(pp_df, aes(value, fill = source, colour = source)) +
+  annotate("rect", xmin = -0.18, xmax = 0.18, ymin = -Inf, ymax = Inf,
+           fill = "grey85", alpha = 0.6) +
+  geom_density(alpha = 0.45, linewidth = 0.6, adjust = 1.2) +
+  facet_grid(model ~ term, scales = "free_y", switch = "y") +
+  scale_fill_manual(values   = c(prior = "grey60", posterior = colorBlindBlack8[6])) +
+  scale_colour_manual(values = c(prior = "grey40", posterior = colorBlindBlack8[6])) +
+  coord_cartesian(xlim = c(-6, 6)) +
+  labs(x = "log-odds", y = NULL, fill = NULL, colour = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        strip.text.y.left = element_text(angle = 0),
+        axis.text.y = element_blank(),
+        panel.grid.minor = element_blank())
+
+p_pp
+ggsave(paste0(plots, "prior_posterior.png"), p_pp, width = 10, height = 7,
+       dpi = 300, bg = "white")
+```
+```{r}
+# how far the posterior moved from the prior, and how much it concentrated
+pp_shift <- pp_df %>%
+  dplyr::group_by(model, term, source) %>%
+  dplyr::summarise(med = median(value), sd = sd(value), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = source, values_from = c(med, sd)) %>%
+  dplyr::mutate(
+    shrink_factor = round(sd_prior / sd_posterior, 1),   # >1 = data narrowed it
+    med_shift     = round(med_posterior - med_prior, 2)
+  )
+pp_shift
+```
+
+
+## Prior sensitivity and the basis for reporting the present sample
+
+*Note added 20 August 2026.*
+
+The table above refits each registered model twice more, changing only the priors and holding the data, the formula and the random-effects structure fixed. The "tight" arm halves the width of the prior on the slopes; the "wide" arm doubles it. If a conclusion depends on which of these we chose rather than on what we observed, that dependence shows up as a change in the `verdict` columns.
+
+### What the comparison shows
+
+Every one of the 14 coefficients moves toward zero under the tighter priors and away from zero under the wider ones, with a median absolute shift of 0.61 on the log-odds scale. The prior is therefore doing more work in this analysis than a reader might assume, and it is worth being explicit about where.
+
+The influence is not spread evenly. It tracks the width of the credible interval almost exactly. Where an interval is narrower than 2 log-odds, halving the prior moves the estimate by between 9% and 30%: the effect of index use on success, the narrowest estimate we have at 1.09, moves by 9%. Where an interval exceeds 4 log-odds, the same change moves the estimate by between 54% and 68%. In other words, our well-identified effects are determined by the data, and our poorly identified ones are determined in substantial part by the prior. The 2 log-odds threshold that we preregistered as our precision criterion turns out to fall close to the point at which prior influence becomes material, which we note was not anticipated when that threshold was chosen.
+
+### How much the data constrain each estimate
+
+A second, more direct check is to compare each posterior against the prior on the same model, refitting with `sample_prior = "only"`. Where the data are informative, the posterior is markedly narrower than the prior and displaced from it; where they are not, the two largely coincide.
+
+All prior medians sit at zero, as specified. Every posterior is displaced from zero, and the degree of concentration separates the estimates cleanly. The association between index use and success is the most strongly constrained: the posterior standard deviation is 5.4 times narrower than the prior (1.49 to 0.28). Icon use and success follows at 3.9, and the two main effects on index use at 3.3 each. The two main effects on communicative success, including the size effect that tests H1, are constrained by a factor of 2.8 (1.50 to 0.53).
+
+The three interaction terms are the least constrained, at factors between 1.3 and 1.9, as are the two main effects on icon use (1.8 and 1.9). For the size-by-distance interaction on icon use, the posterior is only 1.3 times narrower than the prior, and we do not interpret that coefficient.
+
+### Conclusions that hold under every prior specification
+
+Two substantive verdicts are unchanged across all three arms.
+
+The effect of referent size on communicative success (H1) lies below the region of practical equivalence under the registered, tighter and wider priors alike: -1.76 [-2.78, -0.68], an odds ratio of about 0.17. Complete spatial frames are communicated substantially less successfully than elements of spatial frames, and this does not depend on our prior choices. Even the most conservative arm places the estimate at -1.25, still clear of the boundary.
+
+The association between index use and success is likewise robust: 0.95 [0.41, 1.50], an odds ratio of about 2.59, above the region of practical equivalence in all three arms and the least prior-sensitive estimate in the analysis. This was not a registered hypothesis and we report it as such.
+
+### Effects estimated with lower precision
+
+Four verdicts change between prior arms, and we describe each in terms of what the data do and do not determine.
+
+The effect of spatial distance on success is negative in all three arms and constrained by a factor of 2.8, so the direction is determined by the data rather than the prior. Its classification against the equivalence region is less secure: the interval falls below the region under the registered and wider priors, -1.28 [-2.35, -0.20], but its upper bound sits 0.023 log-odds outside the boundary and moves inside it under the tighter prior. We therefore report that the data do not support the no-difference component of H2, that displaced targets are communicated less successfully than proximate ones, and that the magnitude of this difference is estimated with limited precision.
+
+Strategy use shifts with spatial distance in the direction predicted by H2a and H2b. Index use is less likely for displaced targets, -1.04 [-1.97, -0.09], with the posterior 3.3 times narrower than the prior; icon use is correspondingly more likely, 1.88 [0.07, 3.45], at a factor of 1.8. Both intervals fall just short of clearing the equivalence region at one bound. The registered single-binary model is inconclusive in every arm, and is fitted to 315 of 480 trials because the single-binary coding excludes the 125 trials on which icon and index co-occur and the 40 on which neither strategy was coded. Our two split models use all codeable trials and agree with each other; we treat them as the primary evidence on strategy selection and the registered model as a more conservative check.
+
+The three interaction terms are the least well determined in the analysis, with posteriors between 1.3 and 1.9 times narrower than their priors. We do not draw conclusions from them.
+
+### The registered precision criterion
+
+Our preregistration specified that a further batch of dyads would be collected if any primary effect's 95% credible interval exceeded 2 log-odds in width. This criterion is met for all three primary effects: 2.10 for size on success, 2.15 for distance on success, and 4.07 for distance on strategy in the registered model. We report this openly rather than reclassifying the effects concerned, and we mark as provisional every effect whose interval exceeds the registered threshold. 
+
+### Why we report the present sample
+
+We collected `r n_distinct(df$pair)` dyads (`r nrow(df)` trials) within a single summer recruitment window. As stated in the preregistration, convenience sampling from students and university staff is constrained in this period, and the final number was set by recruitment capacity alone. No model was fitted and no inferential analysis was conducted until collection had closed, so the sample size is not data-dependent, and no interim analysis was performed at the 20-dyad checkpoint described in the registered plan.
+
+The registered sample size was motivated by a target of at least 20 productions per unique item. Thirty dyads yield 30 productions per item, 50% above that target. The imprecision documented above does not arise from the sample being smaller than planned; it arises from the distribution of strategies across conditions. Index use occurs on only 2 and 3 trials in the two complete-frame cells, and the four-way configuration `neither` is absent from the element-proximate cell entirely. Those cells constrain the interaction terms regardless of how many dyads contribute to the remaining cells.
+
+We therefore report the effect of referent size on success (H1) and the association between index use and success as supported and robust to prior specification; the effect of spatial distance on success and on strategy selection as directionally determined by the data but estimated with limited precision; and the interaction terms as not sufficiently constrained to interpret. The sensitivity analysis and the prior-posterior comparison are included so that readers can see which of these conclusions rest on the data and which would move under a different, equally defensible prior.
 
 # Convergence summary
 

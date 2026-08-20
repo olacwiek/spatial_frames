@@ -94,6 +94,8 @@ capFig = function(x){
     capFigNo <<- capFigNo + 1
   }; x
 }
+
+lang_tag <- "_en"     # set to "" once you no longer need the Polish versions
 ```
 
 ## Load the precomputed distances
@@ -104,11 +106,52 @@ The distances were built once in the embedding script and saved to `output/conce
 D <- readRDS(paste0(output, "conceptnet_distance.rds"))
 D <- as.matrix(D)
 diag(D) <- 0                 # guard: self-distance is exactly 0
+
+########## Polish -> English concept labels ####################################
+# Single point of control for figure/table language. The saved matrix stays
+# Polish (it is the ground truth: these are /c/pl/ vectors); we translate only
+# at the presentation layer. Spellings match the `target` column of the gesture
+# dataset so both manuscripts use the same English names.
+concept_en <- c(
+  "dom"          = "house",
+  "pokój"        = "room",
+  "piwnica"      = "basement",
+  "strych"       = "attic",
+  "schody"       = "stairs",
+  "okno"         = "window",
+  "krzesło"      = "chair",
+  "kanapa"       = "sofa",
+  "dywan"        = "carpet",
+  "wieszak"      = "coathanger",
+  "obraz"        = "painting",
+  "laboratorium" = "laboratory",
+  "drzewo"       = "tree",
+  "góry"         = "mountains",
+  "miasto"       = "city",
+  "wieś"         = "countryside"
+)
+names(concept_en) <- enc2utf8(names(concept_en))   # diacritics survive on Windows
+
+# passes unmatched names through unchanged, so it is safe to reuse on Vmat
+relabel <- function(x) {
+  hit <- concept_en[enc2utf8(x)]
+  unname(ifelse(is.na(hit), x, hit))
+}
+
+# fail loudly rather than silently plotting a mix of two languages
+missing_map <- setdiff(enc2utf8(rownames(D)), names(concept_en))
+if (length(missing_map))
+  stop("No English label for: ", paste(missing_map, collapse = ", "))
+
+dimnames(D) <- list(relabel(rownames(D)), relabel(colnames(D)))
+stopifnot(!anyDuplicated(rownames(D)))
+################################################################################
+
 S <- 1 - D                   # similarity, for the parts that want it
 d <- as.dist(D)              # 'dist' object for clustering / MDS
 
 stopifnot(isSymmetric(round(D, 10)))
-rownames(D)                  # sanity check: labels incl. krzesło, pokój, góry, wieś
+rownames(D)                  # sanity check: house, room, chair, countryside, ...
 ```
 
 # Table of distances
@@ -155,7 +198,8 @@ vec_path <- paste0(output, "conceptnet_vectors.rds")
 pv <- NULL; stable <- list()
 if (file.exists(vec_path) && requireNamespace("pvclust", quietly = TRUE)) {
   Vmat <- as.matrix(readRDS(vec_path))                    # concepts x dims
-  rownames(Vmat) <- sub("^/c/pl/", "", rownames(Vmat))    # URIs -> bare words, to match D
+  rownames(Vmat) <- sub("^/c/pl/", "", rownames(Vmat))    # URIs -> bare words
+  rownames(Vmat) <- relabel(rownames(Vmat))               # Polish -> English, same map as D
   Vmat <- Vmat[rownames(D), , drop = FALSE]               # align (and subset) to D's labels
   set.seed(1)
   pv <- pvclust::pvclust(t(Vmat), method.hclust = "ward.D2",
@@ -202,11 +246,40 @@ knitr::kable(
                           ". Peripheral: ", paste(concepts_all[grp == "peripheral"], collapse = ", "), ".")))
 ```
 
+```{r}
+# Descriptive names in place of C1-C4, assigned by membership rather than by
+# position, so the mapping cannot silently break if the cluster order changes.
+cluster_names <- c(
+  attic     = "Storage and passage",
+  chair     = "Furniture",
+  house     = "Dwelling",
+  city      = "Settlements"
+)
+
+lab_for <- function(members) {
+  hit <- cluster_names[intersect(names(cluster_names), members)]
+  if (length(hit) != 1) stop("Cluster not identified: ", paste(members, collapse = ", "))
+  unname(hit)
+}
+
+new_names <- vapply(trusted, lab_for, character(1))
+names(trusted) <- new_names
+
+grp <- setNames(rep("peripheral", length(concepts_all)), concepts_all)
+for (nm in names(trusted)) grp[trusted[[nm]]] <- nm
+
+grp_levels <- c("Furniture", "Storage and passage", "Dwelling", "Settlements", "peripheral")
+pal_grp    <- setNames(c(colorBlindBlack8[c(2, 3, 4, 6)], "grey55"), grp_levels)
+
+trusted   # check the membership before moving on
+```
+
+
 ## Figure 1 — similarity network (main manuscript candidate)
 
 Every channel is a statistic: **node colour = consensus cluster**, **node size = local density** (mean similarity to its 3 nearest neighbours), **edge thickness = similarity strength**, and an edge exists only above the similarity threshold or as a nearest-neighbour link. A concept looks isolated precisely when its only links are thin — the reason is visible, not hidden.
 
-```{r fig-network, fig.width=9, fig.height=8}
+```{r fig-network, fig.width=11, fig.height=10}
 library(ggraph)
 
 set.seed(1)
@@ -218,27 +291,30 @@ lay$dens <- dens[lay$name]
 p_net <- ggraph(lay) +
   geom_edge_link(aes(width = weight), colour = "grey55", alpha = 0.55,
                  show.legend = FALSE) +
-  scale_edge_width(range = c(0.4, 3.0)) +
+  scale_edge_width(range = c(0.5, 4.0)) +
   geom_node_point(aes(fill = grp, size = dens), shape = 21,
                   colour = "black", stroke = 0.7) +
-  scale_size(range = c(4, 13), guide = "none") +
-  scale_fill_manual(values = pal_grp, name = "cluster") +
+  scale_size(range = c(6, 17), guide = "none") +
+  scale_fill_manual(values = pal_grp, name = NULL) +
+  guides(fill = guide_legend(override.aes = list(size = 6))) +
   geom_node_text(aes(label = name), repel = TRUE, fontface = "bold",
-                 size = 4.3, colour = "black", seed = 1, max.overlaps = Inf,
-                 point.padding = unit(0.4, "lines"), box.padding = unit(0.35, "lines")) +
+                 size = 7, colour = "black", seed = 1, max.overlaps = Inf,
+                 min.segment.length = 0, segment.colour = "grey70",
+                 point.padding = unit(0.5, "lines"),
+                 box.padding = unit(0.5, "lines")) +
   coord_equal(clip = "off") +
-  theme_void(base_size = 14) +
+  theme_void(base_size = 18) +
   theme(legend.position = "bottom",
-        legend.title = element_text(face = "bold", size = 12),
-        legend.text  = element_text(size = 12),
-        plot.margin  = margin(12, 24, 12, 24))
+        legend.text     = element_text(size = 16),
+        plot.margin     = margin(14, 28, 14, 28))
 
 p_net
-ggsave(paste0(plots, "semantic_network.png"), p_net, width = 9, height = 8, dpi = 300, bg = "white")
-ggsave(paste0(plots, "semantic_network.pdf"), p_net, width = 9, height = 8, bg = "white")
+ggsave(paste0(plots, "semantic_network", lang_tag, ".png"), p_net,
+       width = 11, height = 10, dpi = 600, bg = "white")
+ggsave(paste0(plots, "semantic_network", lang_tag, ".pdf"), p_net,
+       width = 11, height = 10, bg = "white")
 ```
-`r capFig(sprintf("Similarity network. Node colour = consensus cluster (grey = peripheral); node size = local density; edge thickness = cosine similarity; layout = force-directed (Fruchterman-Reingold). %s.", method_note))`
-`r capFig(sprintf("Similarity network. Node colour = consensus cluster (%s); node size = local density; edge thickness = cosine similarity; layout = force-directed (Fruchterman-Reingold).", method_note))`
+`r capFig("Similarity network of the 16 targets, from ConceptNet Numberbatch embeddings of the Polish concepts. An edge joins two concepts whose cosine similarity is among the strongest 30% of all pairs, plus each concept's single nearest neighbour, so no concept is left unconnected. Node colour marks a cluster recovered by both bootstrap resampling and community detection; grey nodes were not consistently grouped. Node size is local density (mean similarity to the three nearest neighbours) and edge thickness is cosine similarity. Layout is force-directed (Fruchterman-Reingold), so node position derives from the connections themselves rather than from a projection. Targets were presented in Polish; English glosses shown.")`
 
 This figure is a graph. Each node is a concept, and an edge joins two concepts when their cosine similarity is high: we keep the strongest ~30% of all pairwise links, plus every concept's single nearest neighbour, so that nothing is left completely unconnected. The result is drawn with a **force-directed (Fruchterman–Reingold) layout** – an algorithm that treats edges as springs pulling linked nodes together and all nodes as mutually repelling, then settles the system into equilibrium.
 
@@ -257,7 +333,7 @@ Read this way, the figure is self-explaining. Dense clusters appear as tight, th
 
 Same consensus clusters and same encodings, but on an MDS layout. Positions are only approximate (see fidelity in the caption), so trust the colours, sizes and nearest-neighbour lines over raw distance on the page.
 
-```{r fig-map, fig.width=9, fig.height=7.5}
+```{r fig-map, fig.width=11, fig.height=9}
 mds_cl <- cmdscale(d, k = 2, eig = TRUE); gof <- 100 * mds_cl$GOF[1]
 nm <- tryCatch(MASS::isoMDS(d, k = 2, trace = FALSE), error = function(e) NULL)
 if (!is.null(nm)) { P <- nm$points; stress <- nm$stress } else { P <- mds_cl$points; stress <- NA }
@@ -274,30 +350,34 @@ edges  <- data.frame(x = coords$x, y = coords$y,
 p_map <- ggplot(coords, aes(x, y)) +
   geom_mark_hull(data = subset(coords, grp != "peripheral"),
                  aes(fill = grp, group = grp), concavity = 5,
-                 expand = unit(5, "mm"), radius = unit(5, "mm"),
+                 expand = unit(6, "mm"), radius = unit(6, "mm"),
                  alpha = 0.18, colour = NA, show.legend = FALSE) +
   geom_segment(data = edges, aes(x, y, xend = xend, yend = yend),
-               colour = "grey55", linewidth = 0.7, inherit.aes = FALSE) +
-  geom_point(aes(fill = grp, size = dens), shape = 21, colour = "black", stroke = 0.6) +
-  ggrepel::geom_text_repel(aes(label = concept), fontface = "bold", size = 4.2,
+               colour = "grey55", linewidth = 0.8, inherit.aes = FALSE) +
+  geom_point(aes(fill = grp, size = dens), shape = 21, colour = "black", stroke = 0.7) +
+  ggrepel::geom_text_repel(aes(label = concept), fontface = "bold", size = 7,
                            seed = 1, max.overlaps = Inf, colour = "black",
-                           point.padding = unit(0.4, "lines"), box.padding = unit(0.35, "lines")) +
-  scale_fill_manual(values = pal_grp, name = "cluster") +
-  scale_size(range = c(4, 12), guide = "none") +
+                           min.segment.length = 0, segment.colour = "grey70",
+                           point.padding = unit(0.5, "lines"),
+                           box.padding = unit(0.5, "lines")) +
+  scale_fill_manual(values = pal_grp, name = NULL) +
+  scale_size(range = c(6, 16), guide = "none") +
+  guides(fill = guide_legend(override.aes = list(size = 6))) +
   coord_equal(clip = "off") +
-  scale_x_continuous(expand = expansion(mult = 0.15)) +
-  scale_y_continuous(expand = expansion(mult = 0.15)) +
-  theme_void(base_size = 14) +
+  scale_x_continuous(expand = expansion(mult = 0.18)) +
+  scale_y_continuous(expand = expansion(mult = 0.18)) +
+  theme_void(base_size = 18) +
   theme(legend.position = "bottom",
-        legend.title = element_text(face = "bold", size = 12),
-        legend.text  = element_text(size = 12),
-        plot.margin  = margin(12, 20, 12, 20))
+        legend.text     = element_text(size = 16),
+        plot.margin     = margin(14, 24, 14, 24))
 
 p_map
-ggsave(paste0(plots, "semantic_map.png"), p_map, width = 9, height = 7.5, dpi = 300, bg = "white")
-ggsave(paste0(plots, "semantic_map.pdf"), p_map, width = 9, height = 7.5, bg = "white")
+ggsave(paste0(plots, "semantic_map", lang_tag, ".png"), p_map,
+       width = 11, height = 9, dpi = 600, bg = "white")
+ggsave(paste0(plots, "semantic_map", lang_tag, ".pdf"), p_map,
+       width = 11, height = 9, bg = "white")
 ```
-`r capFig(sprintf("Semantic map. Layout: %s (stress %s, classical GOF %.0f%%) - positions approximate. Node colour = consensus cluster; node size = local density; grey lines = nearest neighbour.", ifelse(is.na(stress), "classical MDS", "non-metric MDS"), ifelse(is.na(stress), "n/a", sprintf("%.0f%%", stress)), gof))`
+`r capFig("Semantic map of the 16 targets, from ConceptNet Numberbatch embeddings of the Polish concepts. Node colour marks a cluster recovered by both bootstrap resampling and community detection; grey nodes were not consistently grouped. Node size is local density (mean similarity to the three nearest neighbours) and grey lines connect nearest neighbours. Positions are a two-dimensional projection of a 300-dimensional space and are approximate; the clustering, not the on-screen distance, carries the result. Targets were presented in Polish; English glosses shown.")`
 
 This figure places the concepts by **multidimensional scaling (MDS)**, which arranges points in two dimensions so that on-screen distances approximate the true distances in the full 300-dimensional embedding as closely as possible. Unlike the network, this *is* a compression, and the caption reports how much structure survives it (non-metric stress ≈ 18%, classical goodness-of-fit ≈ 35%). Either way the positions are only approximate and should be read as a sketch rather than exact coordinates.
 
@@ -442,8 +522,7 @@ p_sim <- ggplot(df_tile, aes(row, col, fill = sim)) +
         panel.grid  = element_blank())
 
 p_sim
-ggsave(paste0(plots, "similarity_matrix.png"), p_sim, width = 9.5, height = 8.5,
-       dpi = 300, bg = "white")
+ggsave(paste0(plots, "similarity_matrix", lang_tag, ".png"), p_sim, width = 9.5, height = 8.5, dpi = 300, bg = "white")
 ```
 `r capFig("Pairwise cosine similarity between all 16 concepts, ordered by clustering. Green = more similar than average, red = less; the diagonal is blank. Green blocks on the diagonal are the clusters; predominantly-red rows/columns are the peripheral concepts.")`
 

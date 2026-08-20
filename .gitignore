@@ -1,3 +1,5 @@
 Numberbatch/*.txt
 Numberbatch/*.gz
 AsPredicted #302703
+# Fitted brms objects - regenerate with 3_modeling.Rmd (seed 2137)
+models/
