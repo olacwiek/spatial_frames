@@ -1,0 +1,313 @@
+---
+title: "Communicating spatial frames with whole-body silent gesture"
+subtitle: "Model fitting"
+author: "Analysis by AĆ"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmarkdown::html_document:
+    theme: readable
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    df_print: paged
+    code_folding: hide
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '3'
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This is the third script in the spatial-frames pipeline. It fits every model and caches each to its own file in `models/`. Nothing is interpreted here; the fitted objects are the output. Estimates, tests, ROPE decisions, and figures are all in `4_results.Rmd`.
+
+All models are Bayesian multilevel Bernoulli (logit) models fit with `brms`. The family is fixed by design — both outcomes are binary — so there is no likelihood-selection step. Priors, contrasts, and the random-effects structure follow the preregistration.
+
+**The models.**
+
+*Confirmatory.*
+
+-   **H2a** and **H2b** are the strategy hypotheses. Because icon and index are coded as independent, sometimes co-occurring flags rather than one icon-or-index label, they are fit as two separate Bernoulli models — `icon ~ size * distance` and `index ~ size * distance`. One coefficient carries each hypothesis: H2a on the distance slope of the icon model (displaced → more icon), H2b on the distance slope of the index model (proximate → more index).
+-   **Model B** (`correct_target ~ size * distance + icon_c + index_c`) carries H1 (the size slope, complete < element) and the no-difference component of H2 (the distance slope, tested against the ROPE). The strategy flags enter centered (±0.5) as covariates.
+-   **Model B, no strategy** (`correct_target ~ size * distance`) is the registered robustness fit that recovers the total size effect without conditioning on strategy.
+-   **Registered Model A** (`rep_strategy ~ size * distance`) is fit on the subset of productions coded as exactly one of icon or index (`rep_strategy` = 1 for index, 0 for icon). This is the single-binary strategy model as originally preregistered, retained as a robustness check where its icon-or-index assumption holds.
+
+*Exploratory (post hoc, not preregistered).*
+
+-   **Third strategy** (`prop ~ size * distance`): the unregistered third strategy, modeled as its own Bernoulli exactly as icon and index are, to test whether its use depends on the design.
+-   **Co-occurrence indicator** (`both ~ size * distance`): a Bernoulli on whether icon and index were used together — the headline test of whether layering depends on condition.
+-   **Configuration** (`strategy_combo ~ size * distance`, categorical): the four-way partition `neither / icon_only / index_only / both` with `neither` as reference, giving the full picture of how strategy configuration shifts across the design. Random intercepts only, since a full random-slope structure across three linear predictors is not warranted for an exploratory model.
+
+**Specifications common to the confirmatory models.**
+
+-   `size` and `distance` use unweighted **±0.5 sum coding** (element / proximate = −0.5, complete / displaced = +0.5), so each lower-order term is a main effect at the midpoint of the other factor and the intercept sits at the center of the design.
+-   **Priors** (preregistered): Normal(0, 1.5) on fixed slopes, Normal(0, 2) on the intercept, Exponential(1) on random-effect SDs, LKJ(2) on random-effect correlations.
+-   **Random effects** are maximal — by-producer and by-guesser intercepts and `size * distance` slopes, plus a by-item intercept — with a preregistered **fallback ladder** applied when a model does not converge (R-hat ≤ 1.01, zero divergent transitions): drop the correlation terms, then the interaction slope, then the main-effect slopes, guesser before producer. `fit_ladder()` fits from the maximal structure down and returns the first level that converges.
+-   Four chains, 10,000 iterations, 4,000 warmup, `adapt_delta = 0.95`. 
+
+**Caching.** Each model is saved to `models/<name>.rds` and reloaded on re-knit. Set `refit_all <- TRUE` (or delete `models/`) to refit — the cache keys on the filename, not the data, so switch it on when the real annotation replaces the simulated file.
+
+# Data preparation
+
+## Source setup
+
+```{r source setup, echo = TRUE, message=FALSE, warning = FALSE}
+
+########## folders ##########
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+parentfolder <- dirname(getwd())
+
+data          <- paste0(parentfolder, '/data/')
+models        <- paste0(parentfolder, '/models/')
+plots         <- paste0(parentfolder, '/plots/')
+scripts       <- paste0(parentfolder, '/scripts/')
+
+if (!dir.exists(models)) dir.create(models, recursive = TRUE)
+
+#################### packages ####################
+library(tidyverse)
+library(knitr)
+
+# Bayesian
+library(brms)
+library(posterior)     # rhat / draws
+library(bayesplot)     # divergence count
+
+# use all available cores for parallel computing
+options(mc.cores = parallel::detectCores())
+
+# If cmdstanr is installed it is faster; uncomment to use it globally.
+# options(brms.backend = "cmdstanr")
+
+######## refit switch ########
+# FALSE = load cached fits from models/ when present (fast re-knit).
+# TRUE  = ignore the cache and refit everything. Turn ON when the real
+#         annotation replaces the simulated file (cache keys on filename).
+refit_all <- FALSE
+```
+
+## Load prepared data
+
+```{r load data, echo=TRUE, message=FALSE, warning=FALSE}
+df <- readRDS(paste0(data, "df_prepared.rds")) %>%
+  mutate(item = story_id)     # 16-level item id for the by-item random effect
+```
+
+## Contrasts and derived variables
+
+`size` and `distance` get unweighted ±0.5 sum coding (level 1 = −0.5, level 2 = +0.5). With levels ordered element/complete and proximate/displaced, a positive slope means higher for complete and for displaced, respectively. The strategy flags are centered to ±0.5 for Model B, `both` marks icon-index co-occurrence, and `df_single` is the single-coded subset for the registered Model A.
+
+```{r contrasts, echo=TRUE, message=FALSE, warning=FALSE}
+# --- ±0.5 sum coding (equivalent to MASS::contr.sdif(2) for a 2-level factor) ---
+contrasts(df$size)     <- matrix(c(-0.5, 0.5), nrow = 2,
+                                 dimnames = list(NULL, "compl"))  # element(-) / complete(+)
+contrasts(df$distance) <- matrix(c(-0.5, 0.5), nrow = 2,
+                                 dimnames = list(NULL, "displ"))  # proximate(-) / displaced(+)
+
+# --- derived variables ---
+df <- df %>%
+  mutate(
+    icon_c  = icon  - 0.5,                       # centered strategy covariates (±0.5)
+    index_c = index - 0.5,
+    both    = as.integer(icon == 1 & index == 1) # icon-index co-occurrence indicator
+  )
+
+# --- single-coded subset for the registered single-binary Model A ---
+df_single <- df %>%
+  filter(strategy_combo %in% c("icon_only", "index_only")) %>%
+  droplevels() %>%
+  mutate(rep_strategy = as.integer(strategy_combo == "index_only"))  # 1 = index, 0 = icon
+
+# re-apply contrasts after subsetting (droplevels can drop the attribute)
+contrasts(df_single$size)     <- matrix(c(-0.5, 0.5), nrow = 2,
+                                        dimnames = list(NULL, "compl"))
+contrasts(df_single$distance) <- matrix(c(-0.5, 0.5), nrow = 2,
+                                        dimnames = list(NULL, "displ"))
+```
+
+# Priors, random-effects ladder, and helpers
+
+```{r helpers, echo=TRUE, message=FALSE, warning=FALSE}
+#################### priors (preregistered) ####################
+priors_base <- c(
+  set_prior("normal(0, 1.5)", class = "b"),
+  set_prior("normal(0, 2)",   class = "Intercept"),
+  set_prior("exponential(1)", class = "sd")
+)
+priors_cor <- c(priors_base, set_prior("lkj(2)", class = "cor"))   # + RE correlations
+
+#################### preregistered RE fallback ladder ####################
+# maximal -> simplest: drop correlations, then the interaction slope, then the
+# main-effect slopes (by-guesser before by-producer). 'cor' flags the level
+# that still has correlation parameters (so it gets the LKJ prior).
+re_ladder <- list(
+  list(re = "(1 + size * distance | producer) + (1 + size * distance | guesser) + (1 | item)", cor = TRUE),
+  list(re = "(1 + size * distance || producer) + (1 + size * distance || guesser) + (1 | item)", cor = FALSE),
+  list(re = "(1 + size + distance || producer) + (1 + size + distance || guesser) + (1 | item)", cor = FALSE),
+  list(re = "(1 + size + distance || producer) + (1 | guesser) + (1 | item)", cor = FALSE),
+  list(re = "(1 | producer) + (1 | guesser) + (1 | item)", cor = FALSE)
+)
+
+#################### diagnostics ####################
+fit_diagnostics <- function(fit) {
+  dr   <- posterior::as_draws(fit)
+  rh   <- suppressWarnings(max(posterior::summarise_draws(dr, "rhat")$rhat, na.rm = TRUE))
+  np   <- bayesplot::nuts_params(fit)
+  ndiv <- sum(np$Value[np$Parameter == "divergent__"])
+  tibble(
+    rhat_max  = round(rh, 4),
+    divergent = ndiv,
+    converged = is.finite(rh) && rh <= 1.01 && ndiv == 0
+  )
+}
+is_converged <- function(fit) isTRUE(fit_diagnostics(fit)$converged)
+
+#################### fit the RE ladder ####################
+# Returns the first RE level that converges; otherwise the simplest, with a
+# warning. Fits lazily: stops at the first convergent level.
+fit_ladder <- function(outcome, fixed, data,
+                       family = bernoulli(),
+                       ladder = re_ladder,
+                       iter = 10000, warmup = 4000, seed = 2137) {
+  chosen <- NULL
+  for (i in seq_along(ladder)) {
+    f  <- as.formula(paste(outcome, "~", fixed, "+", ladder[[i]]$re))
+    pr <- if (ladder[[i]]$cor) priors_cor else priors_base
+    message("  RE level ", i, " ...")
+    cand <- brm(
+      formula = f, data = data, family = family, prior = pr,
+      chains = 4, iter = iter, warmup = warmup, seed = seed,
+      control = list(adapt_delta = 0.95, max_treedepth = 12),
+      refresh = 0
+    )
+    if (is_converged(cand)) {
+      message("  -> converged at RE level ", i)
+      return(cand)
+    }
+    chosen <- cand
+  }
+  warning(outcome, ": no RE level fully converged; keeping simplest (level ",
+          length(ladder), ").")
+  chosen
+}
+
+#################### cache wrapper: one .rds per model ####################
+get_model <- function(tag, fit_fun) {
+  path <- paste0(models, tag, ".rds")
+  if (!refit_all && file.exists(path)) {
+    message("Loading cached model: ", tag)
+    return(readRDS(path))
+  }
+  message("Fitting model: ", tag)
+  fit <- fit_fun()
+  saveRDS(fit, path)
+  fit
+}
+```
+
+# Model fitting
+
+## Confirmatory models
+
+The two strategy Bernoullis (H2a, H2b), Model B (H1 + H2 no-difference), its no-strategy robustness fit, and the registered single-binary Model A on the single-coded subset. Each runs the RE fallback ladder and is cached to its own file.
+
+```{r fit_confirmatory, echo=TRUE, message=TRUE, warning=FALSE, results='hide'}
+# H2a: icon use
+m_icon <- get_model("m_icon", function()
+  fit_ladder("icon", "size * distance", df))
+
+# H2b: index use
+m_index <- get_model("m_index", function()
+  fit_ladder("index", "size * distance", df))
+
+# Model B: communicative success (H1 + H2 no-difference), strategy as covariates
+m_success <- get_model("m_success", function()
+  fit_ladder("correct_target", "size * distance + icon_c + index_c", df))
+
+# Model B robustness: total size effect, no strategy covariates
+m_success_nostrat <- get_model("m_success_nostrat", function()
+  fit_ladder("correct_target", "size * distance", df))
+
+# Registered single-binary Model A, on the single-coded subset (1 = index)
+m_repstrat_registered <- get_model("m_repstrat_registered", function()
+  fit_ladder("rep_strategy", "size * distance", df_single))
+
+models_confirmatory <- list(
+  icon                = m_icon,
+  index               = m_index,
+  success             = m_success,
+  success_nostrat     = m_success_nostrat,
+  repstrat_registered = m_repstrat_registered
+)
+```
+
+## Exploratory models
+
+Post hoc, not preregistered: the co-occurrence indicator (headline test of condition-dependent layering) and the categorical configuration model (the full four-way partition). The categorical model uses random intercepts only.
+
+```{r fit_exploratory, echo=TRUE, message=TRUE, warning=FALSE, results='hide'}
+# third strategy (unregistered): prop use
+m_prop <- get_model("m_prop", function()
+  fit_ladder("prop", "size * distance", df))
+
+# icon-index co-occurrence indicator
+m_both <- get_model("m_both", function()
+  fit_ladder("both", "size * distance", df))
+
+# four-way configuration (neither / icon_only / index_only / both), reference = neither
+m_combo <- get_model("m_combo", function()
+  brm(
+    formula = strategy_combo ~ size * distance +
+      (1 | producer) + (1 | guesser) + (1 | item),
+    data = df, family = categorical(),
+    prior = priors_base,
+    chains = 4, iter = 10000, warmup = 4000, seed = 2137,
+    control = list(adapt_delta = 0.95, max_treedepth = 12),
+    refresh = 0
+  ))
+
+models_exploratory <- list(prop = m_prop, both = m_both, combo = m_combo)
+```
+
+# Convergence summary
+
+R-hat should be ≤ 1.01 and divergent transitions should be 0 for every model. Any `FALSE` in `converged` means the ladder was exhausted (for a confirmatory model) or the categorical model needs a second look before its estimates are used in `4_results.Rmd`.
+
+```{r convergence, echo=TRUE, message=FALSE, warning=FALSE}
+all_fits <- c(models_confirmatory, models_exploratory)
+
+convergence_summary <- imap_dfr(all_fits, function(fit, nm)
+  bind_cols(model = nm, n_obs = nrow(fit$data), fit_diagnostics(fit)))
+
+convergence_summary
+```
+
+```{r convergence_flag, echo=TRUE, message=FALSE, warning=FALSE}
+flagged <- convergence_summary$model[!convergence_summary$converged]
+if (length(flagged) == 0) {
+  message("All models converged (R-hat <= 1.01, 0 divergences).")
+} else {
+  warning("Look again: ", paste(flagged, collapse = ", "))
+}
+```
+
+# Session info
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+sessionInfo()
+```

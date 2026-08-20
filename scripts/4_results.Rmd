@@ -1,0 +1,448 @@
+---
+title: "Communicating spatial frames with whole-body silent gesture"
+subtitle: "Results"
+author: "Analysis by AĆ"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmarkdown::html_document:
+    theme: readable
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    df_print: paged
+    code_folding: hide
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '3'
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This is the fourth script in the spatial-frames pipeline. It loads the models cached by `3_modeling.Rmd`, extracts the estimates, runs the preregistered hypothesis tests, builds the figures, and carries the prose that becomes the Results section. No models are fit here.
+
+**Reporting conventions.** Every effect is reported as a posterior mean, a 95% credible interval (equal-tailed), and a probability of direction (pd). The confirmatory decisions follow the preregistered **ROPE**: a region of practical equivalence of ±`r 0.18` on the log-odds scale (odds ratio 0.84-1.20), with ±`r 0.30` reported as a sensitivity bound. A hypothesis is **supported** when the 95% CrI lies entirely on the predicted side of the ROPE, the no-difference component of H2 is **supported** when the CrI lies entirely inside the ROPE, and any CrI that straddles a ROPE boundary is **inconclusive**. Bayes factors and p-values are neither computed nor reported.
+
+Two coding facts matter on every line. Under ±0.5 sum coding a main effect is an **average** over the other factor, not a reference-level effect, so the intercept is the midpoint of the design and simple effects are recovered as `main ∓ 0.5 × interaction`. And with levels ordered element/complete and proximate/displaced, a **positive** coefficient means higher for complete and for displaced.
+
+**Strategy is two models, not one.** Because icon and index are independent, sometimes co-occurring flags, H2a and H2b are tested on separate Bernoulli models: H2a on the distance slope of the icon model (displaced → more icon, so supported when that slope is entirely *above* the ROPE), H2b on the distance slope of the index model (proximate → more index, so supported when that slope is entirely *below* the ROPE). The registered single-binary Model A is reported as a robustness check.
+
+**Structure.**
+
+-   **H1.** Communicative success: complete < element (Model B size slope).
+-   **H2, no difference.** Success does not differ by distance (Model B distance slope, tested for equivalence).
+-   **H2a.** Icon use rises for displaced targets (icon model distance slope).
+-   **H2b.** Index use rises for proximate targets (index model distance slope).
+-   **Robustness.** Model B without strategy covariates; registered single-binary Model A on the single-coded subset.
+-   **Exploratory (post hoc).** The third strategy (`prop`), icon-index co-occurrence (`both`), and the four-way configuration (categorical).
+
+Placeholders below marked **[PLACEHOLDER]** are for commentary on the MCMC diagnostics and posterior-predictive checks, which we will write together once the models are fit on the empirical data. The numeric results in the prose are pulled inline from the fitted objects, so they update themselves when the real annotation replaces the simulated file and the models are refit.
+
+# Data and models
+
+## Source setup
+
+```{r source setup, echo = TRUE, message=FALSE, warning = FALSE}
+
+########## folders ##########
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+parentfolder <- dirname(getwd())
+
+data          <- paste0(parentfolder, '/data/')
+models        <- paste0(parentfolder, '/models/')
+plots         <- paste0(parentfolder, '/plots/')
+scripts       <- paste0(parentfolder, '/scripts/')
+
+#################### packages ####################
+library(tidyverse)
+library(knitr)
+
+# Bayesian
+library(brms)
+library(posterior)
+library(tidybayes)
+library(bayesplot)
+library(bayestestR)   # optional ROPE cross-check
+library(patchwork)
+
+theme_set(theme_minimal(base_size = 12))
+options(mc.cores = parallel::detectCores())
+
+colorBlindBlack8  <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+                       "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+# Figure / Table caption helpers (manual numbering for HTML):
+outputFormat = opts_knit$get("rmarkdown.pandoc.to");
+if( is.null(outputFormat) ) outputFormat = "";
+capTabNo = 1; capFigNo = 1;
+capTab = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Table ",capTabNo,".** ",x,"")
+    capTabNo <<- capTabNo + 1
+  }; x
+}
+capFig = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Figure ",capFigNo,".** ",x,"")
+    capFigNo <<- capFigNo + 1
+  }; x
+}
+```
+
+## Load models
+
+```{r load models, echo=TRUE, message=FALSE, warning=FALSE}
+model_files <- c("m_icon", "m_index", "m_success", "m_success_nostrat",
+                 "m_repstrat_registered", "m_prop", "m_both", "m_combo")
+
+missing <- model_files[!file.exists(paste0(models, model_files, ".rds"))]
+if (length(missing) > 0)
+  stop("Missing model files in models/: ", paste(missing, collapse = ", "),
+       ". Run 3_modeling.Rmd first.")
+
+models_list <- set_names(
+  map(model_files, ~ readRDS(paste0(models, .x, ".rds"))),
+  model_files
+)
+
+# convenient handles
+m_icon                <- models_list$m_icon
+m_index               <- models_list$m_index
+m_success             <- models_list$m_success
+m_success_nostrat     <- models_list$m_success_nostrat
+m_repstrat_registered <- models_list$m_repstrat_registered
+m_prop                <- models_list$m_prop
+m_both                <- models_list$m_both
+m_combo               <- models_list$m_combo
+```
+
+## Load data (for observed overlays)
+
+```{r load data, echo=TRUE, message=FALSE, warning=FALSE}
+df <- readRDS(paste0(data, "df_prepared.rds"))
+```
+
+## ROPE and extraction helpers
+
+```{r helpers, echo=TRUE, message=FALSE, warning=FALSE}
+#################### preregistered ROPE bounds (log-odds) ####################
+ROPE      <- 0.18   # primary half-width
+ROPE_SENS <- 0.30   # sensitivity bound
+
+#################### position of a 95% CrI relative to a ROPE ####################
+rope_position <- function(lo, hi, r) {
+  if (hi < -r)                     "entirely below the ROPE"
+  else if (lo >  r)                "entirely above the ROPE"
+  else if (lo > -r && hi <  r)     "entirely within the ROPE"
+  else                             "straddling a ROPE boundary"
+}
+
+#################### one coefficient: mean, 95% CrI, pd, ROPE position ####################
+rope_report <- function(fit, coef, rope = ROPE, sens = ROPE_SENS) {
+  d <- posterior::as_draws_df(fit)
+  if (!coef %in% names(d))
+    stop("Coefficient '", coef, "' not found. Available: ",
+         paste(grep("^b_", names(d), value = TRUE), collapse = ", "))
+  x  <- d[[coef]]
+  lo <- unname(quantile(x, 0.025))
+  hi <- unname(quantile(x, 0.975))
+  tibble(
+    coef          = coef,
+    m             = mean(x),
+    lo            = lo,
+    hi            = hi,
+    pd            = max(mean(x > 0), mean(x < 0)),
+    pct_in_rope   = mean(x > -rope & x < rope),
+    position      = rope_position(lo, hi, rope),
+    position_sens = rope_position(lo, hi, sens)
+  )
+}
+
+#################### map a ROPE position to a preregistered decision ####################
+# support_when: "below" | "above" | "within"  (the predicted relation to the ROPE)
+rope_decision <- function(rep_row, support_when) {
+  pos <- rep_row$position
+  supported <- switch(support_when,
+    below  = pos == "entirely below the ROPE",
+    above  = pos == "entirely above the ROPE",
+    within = pos == "entirely within the ROPE")
+  if (isTRUE(supported))            "supported"
+  else if (grepl("straddling", pos)) "inconclusive"
+  else                              "not supported"
+}
+
+#################### tidy printer (rounded copy for display) ####################
+show_rope <- function(rep_row, digits = 2)
+  rep_row %>% mutate(across(c(m, lo, hi), ~round(.x, digits)),
+                     across(c(pd, pct_in_rope), ~round(.x, 3)))
+
+#################### 2x2 design grid, with model contrasts ####################
+design_grid <- expand_grid(
+  size     = factor(c("element", "complete"),   levels = c("element", "complete")),
+  distance = factor(c("proximate", "displaced"), levels = c("proximate", "displaced"))
+)
+contrasts(design_grid$size)     <- matrix(c(-0.5, 0.5), 2, 1, dimnames = list(NULL, "compl"))
+contrasts(design_grid$distance) <- matrix(c(-0.5, 0.5), 2, 1, dimnames = list(NULL, "displ"))
+
+#################### predicted cell probabilities (population level) ####################
+# extra = named list of any additional predictors to hold fixed (e.g. icon_c = 0)
+cell_probs <- function(fit, extra = NULL) {
+  nd <- design_grid
+  for (nm in names(extra)) nd[[nm]] <- extra[[nm]]
+  nd %>%
+    add_epred_draws(fit, re_formula = NA) %>%
+    group_by(size, distance) %>%
+    summarise(p  = mean(.epred),
+              lo = quantile(.epred, 0.025),
+              hi = quantile(.epred, 0.975), .groups = "drop")
+}
+
+# categorical version keeps the .category column
+cell_probs_cat <- function(fit) {
+  design_grid %>%
+    add_epred_draws(fit, re_formula = NA) %>%
+    group_by(size, distance, .category) %>%
+    summarise(p  = mean(.epred),
+              lo = quantile(.epred, 0.025),
+              hi = quantile(.epred, 0.975), .groups = "drop")
+}
+```
+
+## Coefficient map
+
+The exact coefficient names each test reads, so a rename in the models is easy to trace here.
+
+```{r coef_map, echo=TRUE, message=FALSE, warning=FALSE}
+coef_map <- map(models_list, ~ rownames(fixef(.x)))
+coef_map
+```
+
+# Convergence and posterior-predictive checks
+
+R-hat and divergences were checked in `3_modeling.Rmd`; this section is for visual inspection. The plotting code is ready; the commentary is a placeholder until the models are fit on the empirical data.
+
+```{r mcmc_trace, echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=6}
+# Trace plots for the four confirmatory slope parameters (per model).
+mcmc_plot(m_success, type = "trace",
+          variable = c("b_sizecompl", "b_distancedispl", "b_sizecompl:distancedispl"))
+```
+
+**[PLACEHOLDER — MCMC diagnostics.]** Commentary on chain mixing, R-hat, and effective sample sizes for the confirmatory and exploratory models to be written here once the models are fit on the empirical data.
+
+```{r pp_checks, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+# Posterior-predictive bar checks for the binary models; bars for categorical.
+pp_bern <- list(icon = m_icon, index = m_index, success = m_success,
+                prop = m_prop, both = m_both)
+pp_plots <- imap(pp_bern, function(fit, nm)
+  pp_check(fit, type = "bars", ndraws = 100) + ggtitle(nm) +
+    theme(legend.position = "none"))
+wrap_plots(pp_plots, ncol = 2)
+```
+
+```{r pp_check_combo, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+pp_check(m_combo, type = "bars", ndraws = 100) + ggtitle("configuration (categorical)")
+```
+
+**[PLACEHOLDER — posterior-predictive checks.]** Commentary on how well each model reproduces the observed rates of success and of each strategy, across the design cells, to be written here after fitting.
+
+# Confirmatory results
+
+## H1. Communicative success by referent size
+
+```{r h1, echo=TRUE, message=FALSE, warning=FALSE}
+h1        <- rope_report(m_success, "b_sizecompl")
+h1_dec    <- rope_decision(h1, "below")           # complete < element
+h1_probs  <- cell_probs(m_success, extra = list(icon_c = 0, index_c = 0))
+show_rope(h1)
+```
+
+The size effect on communicative success is `r round(h1$m, 2)` log-odds (95% CrI [`r round(h1$lo, 2)`, `r round(h1$hi, 2)`], pd = `r round(h1$pd, 2)`), `r h1$position`. Under the preregistered rule H1 is therefore **`r h1_dec`**; at the ±`r ROPE_SENS` sensitivity bound the same interval is `r h1$position_sens`. On the probability scale, averaged over distance and at average strategy use, complete targets are communicated correctly `r round(100 * mean(h1_probs$p[h1_probs$size == "complete"]), 1)`% of the time versus `r round(100 * mean(h1_probs$p[h1_probs$size == "element"]), 1)`% for element targets.
+
+## H2 (no difference). Success by spatial distance
+
+```{r h2null, echo=TRUE, message=FALSE, warning=FALSE}
+h2n     <- rope_report(m_success, "b_distancedispl")
+h2n_dec <- rope_decision(h2n, "within")            # equivalence
+show_rope(h2n)
+```
+
+The distance effect on success is `r round(h2n$m, 2)` log-odds (95% CrI [`r round(h2n$lo, 2)`, `r round(h2n$hi, 2)`], pd = `r round(h2n$pd, 2)`), `r h2n$position`, with `r round(100 * h2n$pct_in_rope, 1)`% of the posterior inside the ROPE. The no-difference component of H2 is therefore **`r h2n_dec`**; at the sensitivity bound the interval is `r h2n$position_sens`.
+
+## H2a. Icon use by spatial distance
+
+```{r h2a, echo=TRUE, message=FALSE, warning=FALSE}
+h2a       <- rope_report(m_icon, "b_distancedispl")
+h2a_dec   <- rope_decision(h2a, "above")           # displaced -> more icon
+h2a_probs <- cell_probs(m_icon)
+show_rope(h2a)
+```
+
+In the icon model the distance slope is `r round(h2a$m, 2)` log-odds (95% CrI [`r round(h2a$lo, 2)`, `r round(h2a$hi, 2)`], pd = `r round(h2a$pd, 2)`), `r h2a$position`, so H2a is **`r h2a_dec`**. Icon use is `r round(100 * mean(h2a_probs$p[h2a_probs$distance == "displaced"]), 1)`% for displaced targets versus `r round(100 * mean(h2a_probs$p[h2a_probs$distance == "proximate"]), 1)`% for proximate.
+
+## H2b. Index use by spatial distance
+
+```{r h2b, echo=TRUE, message=FALSE, warning=FALSE}
+h2b       <- rope_report(m_index, "b_distancedispl")
+h2b_dec   <- rope_decision(h2b, "below")           # proximate -> more index
+h2b_probs <- cell_probs(m_index)
+show_rope(h2b)
+```
+
+In the index model the distance slope is `r round(h2b$m, 2)` log-odds (95% CrI [`r round(h2b$lo, 2)`, `r round(h2b$hi, 2)`], pd = `r round(h2b$pd, 2)`), `r h2b$position`, so H2b is **`r h2b_dec`**. Index use is `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "proximate"]), 1)`% for proximate targets versus `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "displaced"]), 1)`% for displaced.
+
+## Confirmatory effects against the ROPE
+
+```{r fig_rope, echo=FALSE, fig.align='left', fig.cap=capFig("Confirmatory slope estimates (posterior mean, 95% CrI) against the region of practical equivalence. Shaded band is the primary ROPE (±0.18 log-odds); dashed lines mark the ±0.30 sensitivity bound. H1 is supported when its interval falls entirely left of the band; the H2 no-difference test is supported when the distance-on-success interval falls entirely inside it; H2a is supported to the right of the band and H2b to the left."), fig.height=4, fig.width=8, message=FALSE, warning=FALSE}
+conf_effects <- bind_rows(
+  h1  %>% mutate(param = "H1: size \u2192 success"),
+  h2n %>% mutate(param = "H2: distance \u2192 success"),
+  h2a %>% mutate(param = "H2a: distance \u2192 icon"),
+  h2b %>% mutate(param = "H2b: distance \u2192 index")
+) %>%
+  mutate(param = factor(param, levels = rev(c(
+    "H1: size \u2192 success", "H2: distance \u2192 success",
+    "H2a: distance \u2192 icon", "H2b: distance \u2192 index"))))
+
+ggplot(conf_effects, aes(m, param)) +
+  annotate("rect", xmin = -ROPE, xmax = ROPE, ymin = -Inf, ymax = Inf,
+           fill = colorBlindBlack8[5], alpha = 0.25) +
+  geom_vline(xintercept = c(-ROPE_SENS, ROPE_SENS), linetype = "dashed",
+             colour = "grey60") +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+  labs(x = "Effect (log-odds)", y = NULL) +
+  theme_minimal()
+```
+
+## Predicted probabilities across the design
+
+```{r fig_cells, echo=FALSE, fig.align='left', fig.cap=capFig("Model-predicted probabilities across the 2x2 design (population level, 95% CrI): communicative success, icon use, and index use."), fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+pred_all <- bind_rows(
+  h1_probs  %>% mutate(outcome = "success"),
+  h2a_probs %>% mutate(outcome = "icon"),
+  h2b_probs %>% mutate(outcome = "index")
+) %>%
+  mutate(outcome = factor(outcome, levels = c("success", "icon", "index")))
+
+ggplot(pred_all, aes(distance, p, colour = size, group = size)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi),
+                  position = position_dodge(0.4)) +
+  geom_line(position = position_dodge(0.4)) +
+  facet_wrap(~ outcome) +
+  scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Distance", y = "Predicted probability", colour = "Size") +
+  theme_minimal()
+```
+
+**[PLACEHOLDER — confirmatory synthesis.]** A short paragraph pulling H1, the H2 equivalence test, and H2a/H2b together, to be written once the empirical estimates are in.
+
+## Robustness
+
+### Model B without strategy covariates
+
+```{r rob_nostrat, echo=TRUE, message=FALSE, warning=FALSE}
+h1_tot     <- rope_report(m_success_nostrat, "b_sizecompl")
+h1_tot_dec <- rope_decision(h1_tot, "below")
+show_rope(h1_tot)
+```
+
+Dropping the strategy covariates, the total size effect is `r round(h1_tot$m, 2)` log-odds (95% CrI [`r round(h1_tot$lo, 2)`, `r round(h1_tot$hi, 2)`], pd = `r round(h1_tot$pd, 2)`), `r h1_tot$position` (H1 **`r h1_tot_dec`**), against `r round(h1$m, 2)` in the adjusted model — the size effect `r if (abs(h1_tot$m - h1$m) < 0.1) "is essentially unchanged" else "shifts"` when strategy is not conditioned on.
+
+### Registered single-binary Model A
+
+```{r rob_registered, echo=TRUE, message=FALSE, warning=FALSE}
+# outcome = 1 for index; displaced -> more icon = displaced -> less index,
+# so the registered directional effect is a distance slope below the ROPE.
+regA     <- rope_report(m_repstrat_registered, "b_distancedispl")
+regA_dec <- rope_decision(regA, "below")
+show_rope(regA)
+```
+
+On the subset coded as exactly one of icon or index (`r nrow(m_repstrat_registered$data)` productions), the registered single-coefficient distance effect is `r round(regA$m, 2)` log-odds (95% CrI [`r round(regA$lo, 2)`, `r round(regA$hi, 2)`], pd = `r round(regA$pd, 2)`), `r regA$position`. Read in the registered direction (displaced → more icon, hence fewer index responses) this is **`r regA_dec`**, and it is reported alongside the two-model result as the preregistered check where the icon-or-index assumption holds.
+
+# Exploratory results (post hoc)
+
+These models were not preregistered; they are reported without ROPE decisions, as estimates with 95% CrIs and pd.
+
+## The third strategy (prop)
+
+```{r expl_prop, echo=TRUE, message=FALSE, warning=FALSE}
+prop_dist  <- rope_report(m_prop, "b_distancedispl")
+prop_size  <- rope_report(m_prop, "b_sizecompl")
+prop_probs <- cell_probs(m_prop)
+bind_rows(show_rope(prop_size), show_rope(prop_dist))
+```
+
+Prop use has a distance slope of `r round(prop_dist$m, 2)` log-odds (95% CrI [`r round(prop_dist$lo, 2)`, `r round(prop_dist$hi, 2)`], pd = `r round(prop_dist$pd, 2)`) and a size slope of `r round(prop_size$m, 2)` (95% CrI [`r round(prop_size$lo, 2)`, `r round(prop_size$hi, 2)`], pd = `r round(prop_size$pd, 2)`). **[PLACEHOLDER]** Interpretation of what, if anything, drives the unregistered third strategy, once the empirical rates are in.
+
+## Icon-index co-occurrence
+
+```{r expl_both, echo=TRUE, message=FALSE, warning=FALSE}
+both_dist  <- rope_report(m_both, "b_distancedispl")
+both_size  <- rope_report(m_both, "b_sizecompl")
+both_int   <- rope_report(m_both, "b_sizecompl:distancedispl")
+both_probs <- cell_probs(m_both)
+bind_rows(show_rope(both_size), show_rope(both_dist), show_rope(both_int))
+```
+
+The probability of layering icon and index together has a distance slope of `r round(both_dist$m, 2)` (pd = `r round(both_dist$pd, 2)`), a size slope of `r round(both_size$m, 2)` (pd = `r round(both_size$pd, 2)`), and a size × distance interaction of `r round(both_int$m, 2)` (pd = `r round(both_int$pd, 2)`). **[PLACEHOLDER]** Whether co-occurrence concentrates in particular cells, read against the categorical model below.
+
+```{r fig_both, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted probability of icon-index co-occurrence across the 2x2 design (population level, 95% CrI)."), fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
+ggplot(both_probs, aes(distance, p, colour = size, group = size)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(0.4)) +
+  geom_line(position = position_dodge(0.4)) +
+  scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Distance", y = "P(icon & index)", colour = "Size") +
+  theme_minimal()
+```
+
+## Four-way configuration
+
+```{r expl_combo, echo=TRUE, message=FALSE, warning=FALSE}
+combo_probs <- cell_probs_cat(m_combo)
+combo_probs
+```
+
+**[PLACEHOLDER]** Reading of how the four configurations (`neither / icon_only / index_only / both`) redistribute across the design, relative to the `neither` reference. Recall that `neither` includes prop-only productions.
+
+```{r fig_combo, echo=FALSE, fig.align='left', fig.cap=capFig("Predicted probability of each icon x index configuration across the 2x2 design (population level, stacked posterior means)."), fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+ggplot(combo_probs, aes(distance, p, fill = .category)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  facet_wrap(~ size) +
+  scale_fill_manual(values = colorBlindBlack8[c(1, 2, 3, 6)]) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Distance", y = "Predicted probability", fill = "Configuration") +
+  theme_minimal()
+```
+
+# Optional: ROPE cross-check with bayestestR
+
+A cross-check that the manual ROPE decisions match `bayestestR` on the same bounds and interval; not part of the report.
+
+```{r rope_crosscheck, echo=TRUE, message=FALSE, warning=FALSE}
+bayestestR::rope(m_success, range = c(-ROPE, ROPE), ci = 0.95,
+                 parameters = "b_sizecompl")
+```
+
+# Session info
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+sessionInfo()
+```

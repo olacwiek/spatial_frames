@@ -1,0 +1,454 @@
+---
+title: "Communicating spatial frames with whole-body silent gesture"
+subtitle: "Descriptive statistics"
+author: "Analysis by AĆ"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmarkdown::html_document:
+    theme: readable
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    df_print: paged
+    code_folding: hide
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '3'
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This is the second script in the spatial-frames pipeline (the first, `1_preliminary.Rmd`, covered the semantic-distance work on the referent set). It describes the referential-game data. It fits nothing and tests nothing.
+
+**The study.** Dyads play a referential game in which one partner (the *producer*) communicates a target referent to the other (the *guesser*) through whole-body silent gesture, and the guesser selects from a 16-image response matrix. The design is fully within-dyad, 2 (size: element vs. complete) × 2 (distance: proximate vs. displaced); every dyad completes all four conditions, 16 trials per dyad (one production of each of the 16 fixed stimuli), with producer and guesser roles alternating between partners.
+
+**Two dependent measures.** *Communicative success* (`correct_target`, 1/0) is whether the guesser picked the right referent. *Representation strategy* is coded per production, and here the data depart from the preregistration: rather than a single icon-or-index label, each production carries three independent 0/1 flags — `icon`, `index`, and an unregistered third strategy, `prop` — and they can co-occur (a production may be coded icon *and* index). The modelling script therefore tests H2a and H2b as two separate Bernoulli models (`icon ~ .` and `index ~ .`), a principled deviation forced by discovering co-occurrence after preregistration; the registered single-binary Model A is retained there as a robustness check on the subset coded as exactly one of the two.
+
+**What this script does.** It reads the annotation sheet, cleans it, derives the design variables from `story_id`, builds the unique person keys the models need, reports counts / balance / distributions / co-occurrence, and exports a prepared data frame for the modelling script. Everything the interpretation prose cites is stored in a named object, so the text tracks the data.
+
+**Working on simulated data.** Until the empirical annotation arrives, `data_file` points at the simulated sheet, so every number below is placeholder. Swap that one path for the real coder file and nothing else changes.
+
+# Data preparation
+
+## Source setup
+
+```{r source setup, echo = TRUE, message=FALSE, warning = FALSE}
+
+########## folders ##########
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+parentfolder <- dirname(getwd())
+
+data          <- paste0(parentfolder, '/data/')
+models        <- paste0(parentfolder, '/models/')
+plots         <- paste0(parentfolder, '/plots/')
+scripts       <- paste0(parentfolder, '/scripts/')
+
+#################### packages ####################
+# Core tidyverse for wrangling + plotting; janitor/skimr for structure checks.
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(readxl)
+library(knitr)
+
+# Keep plots/readability consistent
+theme_set(theme_minimal(base_size = 12))
+
+# use all available cores (harmless here; matches project setup)
+options(mc.cores = parallel::detectCores())
+
+colorBlindBlack8  <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+                       "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+# Figure and Table caption helpers (manual numbering for HTML):
+outputFormat = opts_knit$get("rmarkdown.pandoc.to");
+if( is.null(outputFormat) ) outputFormat = "";
+capTabNo = 1; capFigNo = 1;
+capTab = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Table ",capTabNo,".** ",x,"")
+    capTabNo <<- capTabNo + 1
+  }; x
+}
+capFig = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Figure ",capFigNo,".** ",x,"")
+    capFigNo <<- capFigNo + 1
+  }; x
+}
+```
+
+## Load in data
+
+```{r read data, echo=TRUE, message=FALSE, warning=FALSE}
+# SWAP this one line for the real coder sheet when it arrives; if the real
+# file has several coder sheets, add e.g. sheet = "coder_MS".
+data_file <- paste0(data, "annotation_spatialFrames_simulated.xlsx")
+
+df <- read_excel(data_file) %>%
+  clean_names() %>%
+  remove_empty(c("rows", "cols"))   # drops trailing empty rows / stray blank column
+
+# Peek at raw types and missingness
+skim(df)
+```
+
+## Derive design variables and person keys
+
+`story_id` encodes the design as `[size][distance][item]` (e/c = element/complete, p/d = proximate/displaced, 1-4 = item within cell), so `size` and `distance` are decoded straight from it. `story_id` is 1:1 with `trial_id` and `target`, so it also serves as the **item** for the by-item random effect (16 levels). The within-cell index (`item_num`, 1-4) is descriptive only and is *not* the modelling item.
+
+`participant` is a slot *within* the dyad, so it is not a unique person id (slot 1 in one pair is a different person from slot 1 in another). We build a unique producer key by crossing `pair` × `participant`, and the guesser is the partner in the same dyad.
+
+```{r derive, echo=TRUE, message=FALSE, warning=FALSE}
+# --- decode the design from story_id (character at this point) ---
+df <- df %>%
+  mutate(
+    size     = if_else(substr(story_id, 1, 1) == "e", "element",   "complete"),
+    distance = if_else(substr(story_id, 2, 2) == "p", "proximate", "displaced"),
+    item_num = substr(story_id, 3, 3)
+  )
+
+# --- integrity checks: exactly two participants per pair; 16 stimuli ---
+n_per_pair <- df %>% distinct(pair, participant) %>% count(pair)
+if (any(n_per_pair$n != 2))
+  stop("Each pair must have exactly two participants - check the data.")
+if (n_distinct(df$story_id) != 16)
+  warning("Expected 16 unique stimuli in story_id.")
+
+# --- guesser = the partner within the dyad (exactly two members per pair) ---
+partner_lookup <- df %>%
+  distinct(pair, participant) %>%
+  group_by(pair) %>%
+  mutate(guesser_slot = rev(participant)) %>%   # 2 rows per pair -> swaps them
+  ungroup()
+
+df <- df %>%
+  left_join(partner_lookup, by = c("pair", "participant")) %>%
+  mutate(
+    producer = paste(pair, participant,  sep = "_"),   # unique producer id
+    guesser  = paste(pair, guesser_slot, sep = "_")    # unique guesser id
+  )
+```
+
+## Cleaning and types
+
+```{r types, echo=TRUE, message=FALSE, warning=FALSE}
+df <- df %>%
+  mutate(
+    pair        = factor(pair),
+    participant = factor(participant),
+    producer    = factor(producer),
+    guesser     = factor(guesser),
+    story_id    = factor(story_id),          # 16-level item for random effects
+    target      = factor(target),
+    size        = factor(size,     levels = c("element", "complete")),
+    distance    = factor(distance, levels = c("proximate", "displaced")),
+    item_num    = factor(item_num),          # 1-4 within-cell index (descriptive)
+    trial       = as.integer(trial),
+    trial_id    = as.integer(trial_id),
+    correct_target = as.integer(correct_target),
+    icon  = as.integer(icon),
+    index = as.integer(index),
+    prop  = as.integer(prop)
+  )
+```
+
+## Exclusions
+
+Following the preregistration, trials lost to recording failure (no recorded success) or uncodeable for strategy are excluded and their number reported; no outlier- or performance-based exclusions are applied.
+
+```{r exclusions, echo=TRUE, message=FALSE, warning=FALSE}
+df <- df %>%
+  mutate(
+    success_recorded = !is.na(correct_target),
+    strategy_coded   = !(is.na(icon) & is.na(index) & is.na(prop))
+  )
+
+n_rows_raw   <- nrow(df)
+n_no_success <- sum(!df$success_recorded)
+n_uncodeable <- sum(!df$strategy_coded)
+
+# Keep only fully codeable productions for all downstream summaries
+df <- df %>% filter(success_recorded, strategy_coded)
+n_rows_ok <- nrow(df)
+```
+
+Of `r n_rows_raw` recorded productions, `r n_no_success` lacked a recorded outcome and `r n_uncodeable` were uncodeable for strategy, leaving **`r n_rows_ok`** codeable productions for analysis.
+
+# Descriptive statistics
+
+## Sample and balance
+
+These quantities are near-constant by design (the design is balanced and fully crossed), so they are reported as checks: they only move under exclusions.
+
+```{r counts, echo=TRUE, message=FALSE, warning=FALSE}
+n_pairs_obs    <- n_distinct(df$pair)
+n_participants <- n_distinct(c(as.character(df$producer),
+                              as.character(df$guesser)))
+
+trials_per_pair   <- df %>% count(pair, name = "n_trials")
+prod_per_producer <- df %>% count(producer, name = "n_productions")
+prod_per_guesser  <- df %>% count(guesser,  name = "n_guesses")
+prod_per_item     <- df %>% count(story_id, target, name = "n_productions")
+
+min_item_n <- min(prod_per_item$n_productions)
+max_item_n <- max(prod_per_item$n_productions)
+
+trials_per_pair
+```
+
+```{r counts_items, echo=TRUE, message=FALSE, warning=FALSE}
+prod_per_item %>% arrange(n_productions)
+```
+
+The data cover `r n_pairs_obs` dyads (`r n_participants` participants), with `r min(trials_per_pair$n_trials)`-`r max(trials_per_pair$n_trials)` trials per dyad and each producer contributing `r min(prod_per_producer$n_productions)`-`r max(prod_per_producer$n_productions)` productions. Productions per unique referent range from `r min_item_n` to `r max_item_n` (target: at least 20 per referent).
+
+## Communicative success
+
+```{r success, echo=TRUE, message=FALSE, warning=FALSE}
+mean_success <- mean(df$correct_target)
+
+success_by_size <- df %>%
+  group_by(size) %>%
+  summarise(n = n(), rate = mean(correct_target), .groups = "drop")
+
+success_by_distance <- df %>%
+  group_by(distance) %>%
+  summarise(n = n(), rate = mean(correct_target), .groups = "drop")
+
+success_by_cell <- df %>%
+  group_by(size, distance) %>%
+  summarise(n = n(),
+            rate = mean(correct_target),
+            se   = sqrt(rate * (1 - rate) / n), .groups = "drop")
+
+# scalars for inline use
+succ_element  <- success_by_size$rate[success_by_size$size == "element"]
+succ_complete <- success_by_size$rate[success_by_size$size == "complete"]
+succ_prox     <- success_by_distance$rate[success_by_distance$distance == "proximate"]
+succ_disp     <- success_by_distance$rate[success_by_distance$distance == "displaced"]
+
+success_by_cell
+```
+
+Overall, guessers identified the correct target on `r round(100 * mean_success, 1)`% of productions. By referent size, element targets were correct `r round(100 * succ_element, 1)`% of the time versus `r round(100 * succ_complete, 1)`% for complete targets (H1 predicts complete < element; formal testing is in the results script). By distance, proximate targets were correct `r round(100 * succ_prox, 1)`% versus `r round(100 * succ_disp, 1)`% for displaced (H2 predicts no difference on success).
+
+```{r fig_success, echo=FALSE, fig.align='left', fig.cap=capFig("Communicative success rate by size and distance (bars are ±1 binomial SE)."), fig.height=5, fig.width=8, message=FALSE, warning=FALSE}
+ggplot(success_by_cell, aes(x = distance, y = rate, fill = size)) +
+  geom_col(position = position_dodge(0.7), width = 0.6, alpha = 0.9) +
+  geom_errorbar(aes(ymin = rate - se, ymax = rate + se),
+                width = 0.15, position = position_dodge(0.7)) +
+  scale_fill_manual(values = colorBlindBlack8[c(4, 7)]) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Distance", y = "Correct-target rate", fill = "Size") +
+  theme_minimal()
+```
+
+## Participant variability
+
+The models carry by-producer and by-guesser random effects. This is the raw spread they absorb.
+
+```{r participant_var, echo=TRUE, message=FALSE, warning=FALSE}
+producer_success <- df %>%
+  group_by(id = producer) %>%
+  summarise(role = "producer", n = n(),
+            rate = mean(correct_target),
+            se   = sqrt(rate * (1 - rate) / n), .groups = "drop")
+
+guesser_success <- df %>%
+  group_by(id = guesser) %>%
+  summarise(role = "guesser", n = n(),
+            rate = mean(correct_target),
+            se   = sqrt(rate * (1 - rate) / n), .groups = "drop")
+
+participant_success <- bind_rows(producer_success, guesser_success) %>%
+  mutate(role = factor(role, levels = c("producer", "guesser")))
+
+prod_rate_range  <- range(producer_success$rate)
+guess_rate_range <- range(guesser_success$rate)
+```
+
+Producer success rates ranged from `r round(100 * prod_rate_range[1], 1)`% to `r round(100 * prod_rate_range[2], 1)`% and guesser rates from `r round(100 * guess_rate_range[1], 1)`% to `r round(100 * guess_rate_range[2], 1)`%. With a median of `r median(producer_success$n)` productions per participant these per-person estimates are noisy, which is what partial pooling addresses.
+
+```{r fig_participant_var, echo=FALSE, fig.align='left', fig.cap=capFig("Per-participant communicative success rate, ranked within role (points ±1 binomial SE). Spread previews the by-producer and by-guesser random effects; wide bars reflect few productions per participant."), fig.height=5, fig.width=9, message=FALSE, warning=FALSE}
+participant_success %>%
+  group_by(role) %>%
+  arrange(rate) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  ggplot(aes(x = rank, y = rate)) +
+  geom_errorbar(aes(ymin = pmax(0, rate - se), ymax = pmin(1, rate + se)),
+                width = 0, colour = "grey75") +
+  geom_point(size = 1.8, colour = colorBlindBlack8[6]) +
+  facet_wrap(~ role, scales = "free_x") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Participant (ranked by success rate)", y = "Correct-target rate") +
+  theme_minimal()
+```
+
+## Success by referent
+
+```{r item_success, echo=TRUE, message=FALSE, warning=FALSE}
+success_by_item <- df %>%
+  group_by(story_id, target, size, distance) %>%
+  summarise(n = n(),
+            rate = mean(correct_target),
+            se   = sqrt(rate * (1 - rate) / n), .groups = "drop")
+
+# scalars for inline use
+hardest_item <- success_by_item %>% slice_min(rate, n = 1, with_ties = FALSE)
+easiest_item <- success_by_item %>% slice_max(rate, n = 1, with_ties = FALSE)
+
+success_by_item %>% arrange(rate)
+```
+
+The referent hardest to communicate was `r as.character(hardest_item$target)` (`r round(100 * hardest_item$rate, 1)`%), the easiest `r as.character(easiest_item$target)` (`r round(100 * easiest_item$rate, 1)`%). Spread of this size across the 16 fixed referents is what the by-item random effect absorbs.
+
+```{r fig_item_success, echo=FALSE, fig.align='left', fig.cap=capFig("Communicative success rate per referent (points ±1 binomial SE). Colour = size (element / complete), shape = distance (dot = proximate, triangle = displaced). Each referent has a fixed size and distance, so the points fall into the four design cells; spread across the fixed 16-referent set motivates the by-item random effect."), fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+ggplot(success_by_item, aes(x = reorder(target, rate), y = rate)) +
+  geom_errorbar(aes(ymin = pmax(0, rate - se), ymax = pmin(1, rate + se)),
+                width = 0.25, colour = "grey70") +
+  geom_point(aes(colour = size, shape = distance), size = 2.8) +
+  scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
+  scale_shape_manual(values = c(proximate = 16, displaced = 17)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  coord_flip() +
+  labs(x = "Referent (target)", y = "Correct-target rate",
+       colour = "Size", shape = "Distance") +
+  theme_minimal()
+```
+
+## Strategy use
+
+```{r strategy, echo=TRUE, message=FALSE, warning=FALSE}
+prop_icon  <- mean(df$icon)
+prop_index <- mean(df$index)
+prop_prop  <- mean(df$prop)
+
+strategy_by_cell <- df %>%
+  group_by(size, distance) %>%
+  summarise(icon = mean(icon), index = mean(index), prop = mean(prop),
+            n = n(), .groups = "drop")
+
+# scalars: distance is the key axis for H2a/H2b
+icon_prox  <- mean(df$icon[df$distance == "proximate"])
+icon_disp  <- mean(df$icon[df$distance == "displaced"])
+index_prox <- mean(df$index[df$distance == "proximate"])
+index_disp <- mean(df$index[df$distance == "displaced"])
+
+strategy_by_cell
+```
+
+Marginally, icon was used on `r round(100 * prop_icon, 1)`% of productions, index on `r round(100 * prop_index, 1)`%, and the unregistered prop on `r round(100 * prop_prop, 1)`%. Across the distance contrast that H2a/H2b concern, icon use went from `r round(100 * icon_prox, 1)`% (proximate) to `r round(100 * icon_disp, 1)`% (displaced), and index use from `r round(100 * index_prox, 1)`% (proximate) to `r round(100 * index_disp, 1)`% (displaced) - the pattern H2a (displaced → more icon) and H2b (proximate → more index) predict.
+
+```{r fig_strategy, echo=FALSE, fig.align='left', fig.cap=capFig("Strategy use rate by strategy, faceted by size and distance."), fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+strategy_by_cell_long <- strategy_by_cell %>%
+  pivot_longer(c(icon, index, prop), names_to = "strategy", values_to = "rate") %>%
+  mutate(strategy = factor(strategy, levels = c("icon", "index", "prop")))
+
+ggplot(strategy_by_cell_long, aes(x = strategy, y = rate, fill = strategy)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  facet_grid(size ~ distance) +
+  scale_fill_manual(values = colorBlindBlack8[c(2, 3, 4)]) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Use rate", fill = "Strategy") +
+  theme_minimal()
+```
+
+## Icon-index co-occurrence
+
+The reason the strategy analysis splits into two Bernoullis: icon and index are not complementary. This is the model-free view of how often they co-occur, and whether co-occurrence tracks the design - the question the exploratory categorical model would formalise.
+
+```{r cooccur, echo=TRUE, message=FALSE, warning=FALSE}
+prop_both <- mean(df$icon == 1 & df$index == 1)
+
+cooccur_tab <- df %>%
+  count(icon, index, name = "n") %>%
+  mutate(prop = n / sum(n))
+
+# four-way configuration of the icon x index pattern (prop handled separately)
+df <- df %>%
+  mutate(strategy_combo = case_when(
+    icon == 1 & index == 1 ~ "both",
+    icon == 1 & index == 0 ~ "icon_only",
+    icon == 0 & index == 1 ~ "index_only",
+    icon == 0 & index == 0 ~ "neither"
+  ) %>% factor(levels = c("neither", "icon_only", "index_only", "both")))
+
+combo_by_cell <- df %>%
+  count(size, distance, strategy_combo, name = "n") %>%
+  group_by(size, distance) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+cooccur_tab
+```
+
+Icon and index were coded on the same production in `r round(100 * prop_both, 1)`% of cases. Whether that layering concentrates in particular cells is what the figure below shows and the categorical model would test. (Note: `neither` is defined on icon × index only, so it includes prop-only productions.)
+
+```{r fig_cooccur, echo=FALSE, fig.align='left', fig.cap=capFig("Distribution of the icon x index configuration across the 2x2 design - the model-free view the exploratory categorical model formalises."), fig.height=5, fig.width=9, message=FALSE, warning=FALSE}
+ggplot(combo_by_cell, aes(x = distance, y = prop, fill = strategy_combo)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  facet_wrap(~ size) +
+  scale_fill_manual(values = colorBlindBlack8[c(1, 2, 3, 6)]) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Distance", y = "Share of productions", fill = "icon x index") +
+  theme_minimal()
+```
+
+## Success by strategy configuration
+
+```{r success_by_strategy, echo=TRUE, message=FALSE, warning=FALSE}
+success_by_combo <- df %>%
+  group_by(strategy_combo) %>%
+  summarise(n = n(),
+            rate = mean(correct_target),
+            se   = sqrt(rate * (1 - rate) / n), .groups = "drop")
+
+success_by_combo
+```
+
+This is descriptive of the `icon` and `index` covariates that enter Model B; it is not itself a test.
+
+```{r fig_success_by_strategy, echo=FALSE, fig.align='left', fig.cap=capFig("Communicative success rate by icon x index configuration (points ±1 binomial SE). 'neither' includes prop-only productions."), fig.height=5, fig.width=8, message=FALSE, warning=FALSE}
+ggplot(success_by_combo, aes(x = strategy_combo, y = rate)) +
+  geom_col(width = 0.6, fill = colorBlindBlack8[3], alpha = 0.9) +
+  geom_errorbar(aes(ymin = pmax(0, rate - se), ymax = pmin(1, rate + se)),
+                width = 0.15) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "icon x index configuration", y = "Correct-target rate") +
+  theme_minimal()
+```
+
+# Export prepared data
+
+The prepared frame feeds `3_modeling.Rmd`. Saved as `.rds` to preserve factor levels (and any contrasts set later); a `.csv` copy is written for inspection. Redundant helper columns are dropped first.
+
+```{r export, echo=TRUE, message=FALSE, warning=FALSE}
+df <- df %>% select(-guesser_slot, -success_recorded, -strategy_coded)
+
+saveRDS(df,  paste0(data, "df_prepared.rds"))
+write_csv(df, paste0(data, "df_prepared.csv"))
+```
+
+# Session info
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+sessionInfo()
+```

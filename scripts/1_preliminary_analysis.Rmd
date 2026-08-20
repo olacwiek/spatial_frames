@@ -1,0 +1,467 @@
+---
+title: "Communicating spatial frames with whole-body silent gesture"
+subtitle: "Semantic structure of Polish concepts (ConceptNet Numberbatch)"
+author: "Aleksandra Ćwiek"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmarkdown::html_document:
+    theme: readable
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    df_print: paged
+    code_folding: hide
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '3'
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 6)
+```
+
+# Introduction
+
+This document **reads** the pairwise semantic distances between 16 Polish concepts — computed once in the embedding script (`scripts/`) and saved to `output/` — and turns them into a map and a set of tables for the manuscript. Distance is `1 - cosine similarity` of the ConceptNet Numberbatch vectors, the same quantity ConceptNet's `/relatedness` endpoint returns. Because the distances are precomputed and cached, this report is fast to knit and never touches the (currently unavailable) hosted API or the large vector file.
+
+**Read this caveat first.** There are only 16 concepts. Everything below is *descriptive and exploratory* — a way to see and summarise the structure, not to test it. Cluster counts, density numbers and the 2-D map are suggestive, not statistically significant at this sample size. Interpret accordingly.
+
+# Data preparation
+
+## Source setup
+
+```{r source setup, echo = TRUE, message=FALSE, warning = FALSE}
+########## folders ##########
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+parentfolder <- dirname(getwd())
+data          <- paste0(parentfolder, '/data/')
+models        <- paste0(parentfolder, '/models/')
+plots         <- paste0(parentfolder, '/plots/')
+scripts       <- paste0(parentfolder, '/scripts/')
+
+# --- added for this analysis ---
+output        <- paste0(parentfolder, '/output/')          # precomputed matrices are read from here
+dir.create(plots, showWarnings = FALSE, recursive = TRUE)  # figures are written here
+
+#################### packages ####################
+# Core tidyverse for wrangling + plotting; janitor/skimr for structure checks.
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(readxl)
+library(knitr)
+# --- added for the semantic-distance analysis ---
+library(cluster)     # silhouette(): clustering diagnostics
+library(ggforce)     # geom_mark_hull(): cluster territories on the map
+library(ggrepel)     # non-overlapping concept labels
+# NOTE: MASS::isoMDS() is called with :: on purpose — attaching MASS would mask
+#       dplyr::select(). igraph is loaded inside the optional network chunk.
+
+# Keep plots/readability consistent
+theme_set(theme_minimal(base_size = 12))
+
+# use all available cores (harmless here; matches project setup)
+options(mc.cores = parallel::detectCores())
+
+colorBlindBlack8  <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+                       "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+# Figure and Table caption helpers (manual numbering for HTML):
+outputFormat = opts_knit$get("rmarkdown.pandoc.to");
+if( is.null(outputFormat) ) outputFormat = "";
+capTabNo = 1; capFigNo = 1;
+capTab = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Table ",capTabNo,".** ",x,"")
+    capTabNo <<- capTabNo + 1
+  }; x
+}
+capFig = function(x){
+  if(outputFormat == 'html'){
+    x = paste0("**Figure ",capFigNo,".** ",x,"")
+    capFigNo <<- capFigNo + 1
+  }; x
+}
+```
+
+## Load the precomputed distances
+
+The distances were built once in the embedding script and saved to `output/conceptnet_distance.rds`. We simply read them — the `.rds` preserves the Polish diacritics exactly (CSVs can be locale-dependent). Everything below works off this one matrix.
+
+```{r load}
+D <- readRDS(paste0(output, "conceptnet_distance.rds"))
+D <- as.matrix(D)
+diag(D) <- 0                 # guard: self-distance is exactly 0
+S <- 1 - D                   # similarity, for the parts that want it
+d <- as.dist(D)              # 'dist' object for clustering / MDS
+
+stopifnot(isSymmetric(round(D, 10)))
+rownames(D)                  # sanity check: labels incl. krzesło, pokój, góry, wieś
+```
+
+# Table of distances
+
+The full pairwise distance matrix (rounded), followed by the closest and the most distant pairs — the compact numbers to quote in the text.
+
+```{r distance-tables}
+knitr::kable(round(D, 2),
+             caption = capTab("Pairwise cosine distances between all concepts (0 = identical, larger = less related)."))
+
+pairs_df <- as.data.frame(t(combn(rownames(D), 2)), stringsAsFactors = FALSE)
+names(pairs_df) <- c("concept_1", "concept_2")
+pairs_df$distance <- round(D[as.matrix(pairs_df[, 1:2])], 3)
+pairs_df <- pairs_df[order(pairs_df$distance), ]
+
+knitr::kable(head(pairs_df, 8), row.names = FALSE,
+             caption = capTab("Closest concept pairs (smallest distances)."))
+knitr::kable(tail(pairs_df, 8), row.names = FALSE,
+             caption = capTab("Most distant concept pairs (largest distances)."))
+```
+
+# Clustering: robust consensus
+
+We do not pick a number of clusters by optimising silhouette (noisy at n = 16). Instead we keep a group only if it is **both** statistically stable under bootstrap resampling (`pvclust`, reproduced in ≥ 80% of resamples) **and** recovered as a community in the similarity graph (Louvain). Anything the two methods do not agree on is left ungrouped ("peripheral"). This is the grouping used to colour both figures below.
+
+```{r consensus-clustering}
+library(igraph)
+
+## --- similarity graph: nearest-neighbour links + strongest ~30% of links ---
+Sg  <- S; diag(Sg) <- 0
+thr <- quantile(Sg[upper.tri(Sg)], 0.70)
+A   <- (Sg >= thr) * 1
+nnb <- apply(Sg, 1, which.max)                      # each concept's nearest neighbour
+for (i in seq_len(nrow(Sg))) { A[i, nnb[i]] <- 1; A[nnb[i], i] <- 1 }
+g   <- graph_from_adjacency_matrix(Sg * A, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+## --- grouping 1: Louvain communities (no k, no distance-geometry assumption) ---
+set.seed(1)
+louv <- membership(cluster_louvain(g))
+
+## --- grouping 2: pvclust bootstrap stability (needs the saved concept vectors) ---
+au_threshold <- 0.80                                # keep groups reproduced in >= 80% of resamples
+vec_path <- paste0(output, "conceptnet_vectors.rds")
+pv <- NULL; stable <- list()
+if (file.exists(vec_path) && requireNamespace("pvclust", quietly = TRUE)) {
+  Vmat <- as.matrix(readRDS(vec_path))                    # concepts x dims
+  rownames(Vmat) <- sub("^/c/pl/", "", rownames(Vmat))    # URIs -> bare words, to match D
+  Vmat <- Vmat[rownames(D), , drop = FALSE]               # align (and subset) to D's labels
+  set.seed(1)
+  pv <- pvclust::pvclust(t(Vmat), method.hclust = "ward.D2",
+                         method.dist = "uncentered",   # uncentered correlation == cosine
+                         nboot = 1000, quiet = TRUE)
+  stable <- pvclust::pvpick(pv, alpha = au_threshold)$clusters
+}
+
+## --- consensus: pvclust-stable AND Louvain-agreeing ---
+if (length(stable)) {
+  trusted <- Filter(function(m) length(m) >= 2 && length(unique(louv[m])) == 1, stable)
+  method_note <- sprintf("consensus of pvclust bootstrap (AU >= %d%%) and Louvain communities",
+                         round(100 * au_threshold))
+} else {
+  trusted <- Filter(function(m) length(m) >= 2, split(names(louv), louv))
+  method_note <- "Louvain communities only (pvclust vectors not found - see prerequisites)"
+}
+names(trusted) <- paste0("C", seq_along(trusted))
+
+## --- per-concept labels, local density, per-cluster spread ---
+concepts_all <- rownames(D)
+grp <- setNames(rep("peripheral", length(concepts_all)), concepts_all)
+for (nm in names(trusted)) grp[trusted[[nm]]] <- nm
+
+knn    <- 3
+dens   <- sapply(concepts_all, function(i) mean(sort(S[i, ], decreasing = TRUE)[2:(knn + 1)]))
+spread <- sapply(trusted, function(m) mean(D[m, m][lower.tri(D[m, m])]))
+
+## --- colours from YOUR palette (peripheral = grey) ---
+pal_clusters <- colorBlindBlack8[-1]                # reserve pure black; use the coloured entries
+grp_levels   <- c(names(trusted), "peripheral")
+pal_grp      <- setNames(c(pal_clusters[seq_along(trusted)], "grey55"), grp_levels)
+
+## --- summary table ---
+sep <- sapply(names(trusted), function(nm) {
+  m <- trusted[[nm]]; mean(D[m, setdiff(concepts_all, m)])
+})
+knitr::kable(
+  data.frame(cluster = names(trusted), size = lengths(trusted),
+             members = vapply(trusted, paste, character(1), collapse = ", "),
+             spread = round(spread, 3), separation = round(sep, 3), row.names = NULL),
+  row.names = FALSE,
+  caption = capTab(paste0("Trusted clusters — ", method_note,
+                          ". Peripheral: ", paste(concepts_all[grp == "peripheral"], collapse = ", "), ".")))
+```
+
+## Figure 1 — similarity network (main manuscript candidate)
+
+Every channel is a statistic: **node colour = consensus cluster**, **node size = local density** (mean similarity to its 3 nearest neighbours), **edge thickness = similarity strength**, and an edge exists only above the similarity threshold or as a nearest-neighbour link. A concept looks isolated precisely when its only links are thin — the reason is visible, not hidden.
+
+```{r fig-network, fig.width=9, fig.height=8}
+library(ggraph)
+
+set.seed(1)
+xy  <- igraph::layout_with_fr(g, weights = igraph::E(g)$weight)
+lay <- create_layout(g, layout = "manual", x = xy[, 1], y = xy[, 2])
+lay$grp  <- factor(grp[lay$name], levels = grp_levels)
+lay$dens <- dens[lay$name]
+
+p_net <- ggraph(lay) +
+  geom_edge_link(aes(width = weight), colour = "grey55", alpha = 0.55,
+                 show.legend = FALSE) +
+  scale_edge_width(range = c(0.4, 3.0)) +
+  geom_node_point(aes(fill = grp, size = dens), shape = 21,
+                  colour = "black", stroke = 0.7) +
+  scale_size(range = c(4, 13), guide = "none") +
+  scale_fill_manual(values = pal_grp, name = "cluster") +
+  geom_node_text(aes(label = name), repel = TRUE, fontface = "bold",
+                 size = 4.3, colour = "black", seed = 1, max.overlaps = Inf,
+                 point.padding = unit(0.4, "lines"), box.padding = unit(0.35, "lines")) +
+  coord_equal(clip = "off") +
+  theme_void(base_size = 14) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text  = element_text(size = 12),
+        plot.margin  = margin(12, 24, 12, 24))
+
+p_net
+ggsave(paste0(plots, "semantic_network.png"), p_net, width = 9, height = 8, dpi = 300, bg = "white")
+ggsave(paste0(plots, "semantic_network.pdf"), p_net, width = 9, height = 8, bg = "white")
+```
+`r capFig(sprintf("Similarity network. Node colour = consensus cluster (grey = peripheral); node size = local density; edge thickness = cosine similarity; layout = force-directed (Fruchterman-Reingold). %s.", method_note))`
+`r capFig(sprintf("Similarity network. Node colour = consensus cluster (%s); node size = local density; edge thickness = cosine similarity; layout = force-directed (Fruchterman-Reingold).", method_note))`
+
+This figure is a graph. Each node is a concept, and an edge joins two concepts when their cosine similarity is high: we keep the strongest ~30% of all pairwise links, plus every concept's single nearest neighbour, so that nothing is left completely unconnected. The result is drawn with a **force-directed (Fruchterman–Reingold) layout** – an algorithm that treats edges as springs pulling linked nodes together and all nodes as mutually repelling, then settles the system into equilibrium.
+
+The decisive property, and the reason this is the figure we trust, is that **position is derived from the connections themselves**. No projection or compression sits between the data and the picture: two nodes end up close together precisely because they are strongly linked. Distance on the page is therefore meaningful in a way it is not in an ordinary 2-D scatter.
+
+Three further channels each carry a named statistic:
+
+- **Node colour** is the consensus cluster (see below); grey nodes are
+  *peripheral*, i.e. not assigned to any robust group.
+- **Node size** is local density – the mean cosine similarity between a concept and its three nearest neighbours. A large node lives in a crowded region of the space; a small node is comparatively isolated.
+- **Edge thickness** is cosine similarity: thick edges are strong associations, thin edges weak ones.
+
+Read this way, the figure is self-explaining. Dense clusters appear as tight, thickly-webbed groups; isolated concepts dangle at the ends of single thin threads; and a concept that bridges several groups sits between them with many edges fanning out.
+
+## Figure 2 — semantic map (spatial alternative)
+
+Same consensus clusters and same encodings, but on an MDS layout. Positions are only approximate (see fidelity in the caption), so trust the colours, sizes and nearest-neighbour lines over raw distance on the page.
+
+```{r fig-map, fig.width=9, fig.height=7.5}
+mds_cl <- cmdscale(d, k = 2, eig = TRUE); gof <- 100 * mds_cl$GOF[1]
+nm <- tryCatch(MASS::isoMDS(d, k = 2, trace = FALSE), error = function(e) NULL)
+if (!is.null(nm)) { P <- nm$points; stress <- nm$stress } else { P <- mds_cl$points; stress <- NA }
+
+Snd <- S; diag(Snd) <- -Inf
+nnb <- apply(Snd, 1, which.max)                 # nearest neighbour by similarity (self excluded)
+
+coords <- data.frame(concept = rownames(D), x = P[, 1], y = P[, 2],
+                     grp  = factor(grp[rownames(D)], levels = grp_levels),
+                     dens = dens[rownames(D)], stringsAsFactors = FALSE)
+edges  <- data.frame(x = coords$x, y = coords$y,
+                     xend = coords$x[nnb], yend = coords$y[nnb])
+
+p_map <- ggplot(coords, aes(x, y)) +
+  geom_mark_hull(data = subset(coords, grp != "peripheral"),
+                 aes(fill = grp, group = grp), concavity = 5,
+                 expand = unit(5, "mm"), radius = unit(5, "mm"),
+                 alpha = 0.18, colour = NA, show.legend = FALSE) +
+  geom_segment(data = edges, aes(x, y, xend = xend, yend = yend),
+               colour = "grey55", linewidth = 0.7, inherit.aes = FALSE) +
+  geom_point(aes(fill = grp, size = dens), shape = 21, colour = "black", stroke = 0.6) +
+  ggrepel::geom_text_repel(aes(label = concept), fontface = "bold", size = 4.2,
+                           seed = 1, max.overlaps = Inf, colour = "black",
+                           point.padding = unit(0.4, "lines"), box.padding = unit(0.35, "lines")) +
+  scale_fill_manual(values = pal_grp, name = "cluster") +
+  scale_size(range = c(4, 12), guide = "none") +
+  coord_equal(clip = "off") +
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_void(base_size = 14) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text  = element_text(size = 12),
+        plot.margin  = margin(12, 20, 12, 20))
+
+p_map
+ggsave(paste0(plots, "semantic_map.png"), p_map, width = 9, height = 7.5, dpi = 300, bg = "white")
+ggsave(paste0(plots, "semantic_map.pdf"), p_map, width = 9, height = 7.5, bg = "white")
+```
+`r capFig(sprintf("Semantic map. Layout: %s (stress %s, classical GOF %.0f%%) - positions approximate. Node colour = consensus cluster; node size = local density; grey lines = nearest neighbour.", ifelse(is.na(stress), "classical MDS", "non-metric MDS"), ifelse(is.na(stress), "n/a", sprintf("%.0f%%", stress)), gof))`
+
+This figure places the concepts by **multidimensional scaling (MDS)**, which arranges points in two dimensions so that on-screen distances approximate the true distances in the full 300-dimensional embedding as closely as possible. Unlike the network, this *is* a compression, and the caption reports how much structure survives it (non-metric stress ≈ 18%, classical goodness-of-fit ≈ 35%). Either way the positions are only approximate and should be read as a sketch rather than exact coordinates.
+
+The colour and size encodings are identical to Figure 1. The grey lines connect each concept to its nearest neighbour, so that genuine proximity stays visible even where the 2-D projection has distorted it. The map is included because a spatial layout is intuitive and familiar, but it is secondary: where it and the network disagree, trust the network, and in general trust the colours, node sizes and nearest-neighbour lines over raw on-screen distance.
+
+## How the clusters were determined
+
+We deliberately did **not** choose a number of clusters by optimising an internal index (silhouette, elbow); with only 16 concepts those criteria are noisy and easy to over-read. Instead a group is reported only if it survives **two independent tests**:
+
+1. **Bootstrap stability (pvclust).** We cluster the concepts hierarchically, then, for each branch, resample the 300 embedding dimensions 1,000 times and re-cluster each resample. pvclust summarises each branch with an **AU (approximately unbiased) value** – a bias-corrected, bootstrap-calibrated support score on a 0–1 scale, read here as: how reproducibly this exact grouping reappears when we look at different subsets of the semantic space. We keep branches with AU ≥ 0.80.
+2. **Graph community detection (Louvain).** Independently, Louvain finds communities directly from the link structure of the similarity graph – a non-parametric method with no distance geometry and no *k* to set. A cluster is coloured only where **both methods agree**; everything else is labelled peripheral. Each reported cluster is therefore robust to two different things at once: which semantic dimensions happen to be sampled (pvclust) and how the graph happens to be wired (Louvain). Per-branch bootstrap support is shown in the diagnostic figure.
+
+## What the clusters mean
+
+Four groups clear both filters:
+
+- **Furniture / things to sit on** (krzesło, kanapa, dywan) – the densest group (mean within-cluster distance 0.46).
+- **Building fabric / utility spaces** (piwnica, schody, strych) – almost as dense (0.47): the non-living, circulation-and-storage parts of a house.
+- **Dwelling** (pokój, dom) – living space.
+- **Settlements** (miasto, wieś) – types of inhabited place.
+
+## The peripheral concepts
+
+Six concepts – okno, wieszak, obraz, laboratorium, drzewo, góry – are peripheral, meaning they cleared neither both filters. This is a result, not a gap: the data do not support placing them in any group robustly. Two distinct reasons:
+
+- **okno is a bridge, not an orphan.** In the network it has more edges than any other node, linking simultaneously to the furniture, to the building-interior group, and to obraz and wieszak. A concept whose strong ties straddle three groups cannot be a stable member of any one of them – it is the connector, effectively the hub of the room. This is worth stating positively in the text.
+- **The rest hang off a hub, or off nothing.** wieszak and obraz have their single strongest tie to okno, so they dangle from a connector rather than joining a cluster. drzewo's closest concept is already at distance ≈ 0.89 (a faint wood–furniture echo), making it a genuine isolate; laboratorium's strongest link (to piwnica) is too weak to pull it in; and góry associates with wieś but not strongly enough to break into the tight miasto–wieś pair.
+
+One honest nuance belongs in the text: obraz, okno and wieszak all attach to one another through okno, so there is a faint "things on a wall" thread in the data. It is real but too weak to survive as a bootstrap-stable cluster, so we note it in prose rather than drawing it as a group.
+
+## What the figures do and do not license
+
+These are exploratory, descriptive results on 16 concepts, not inferential tests. The embedding captures *distributional* meaning – how words pattern in large corpora and in ConceptNet's relations – so it will not recover human feature dimensions that corpora do not encode: there is no "vertical vs horizontal" axis, for instance, which is why obraz and okno associate through walls and rooms rather than through orientation. Finally, the distances reflect ConceptNet Numberbatch's particular ensemble and its Polish coverage; they are a model of meaning – useful and reproducible – but not a ground truth.
+
+## Bootstrap support (diagnostic / supplement)
+
+Shows how strongly each grouping is supported (AU, red). Useful for the supplement; only runs if the concept vectors were saved.
+
+```{r pvclust-support, eval = exists("pv") && !is.null(pv), fig.width=8, fig.height=6}
+plot(pv, print.num = FALSE, main = "", sub = "", xlab = "")
+pvclust::pvrect(pv, alpha = au_threshold)
+```
+
+This is the diagnostic behind the clustering: the same tree of concepts, but with every branch labelled by **how much support it has**, and a red box drawn around each group that passed our threshold. It answers one question — *are these groups real, or an accident of these particular 16 words?*
+
+**The two numbers on each branch**
+
+Each split shows two values, **AU in red (left)** and **BP in green (right)**, on a 0–100 scale:
+
+- **AU (approximately unbiased)** is the one that matters. It measures how reliably that exact grouping comes back when the analysis is repeated on many resampled versions of the data. Higher = more trustworthy. Our cutoff was **AU ≥ 80**.
+- **BP (bootstrap probability)** is an older, simpler support value, shown only for comparison. It is known to *understate* support for real groups, so where the two disagree we read the red number and ignore the green.
+
+**What the red boxes mean**
+
+A box is drawn around every branch with AU ≥ 80. These are exactly the four clusters we report, and each has strong support:
+
+- **miasto, wieś** — AU 93
+- **dywan, krzesło, kanapa** — AU 100
+- **pokój, dom** — AU 93
+- **piwnica, schody, strych** — AU 86
+
+In other words, the four groups are not a judgement call — they are the branches the resampling actually certifies.
+
+**Why the six peripheral concepts fall outside the boxes**
+
+The figure also makes the "peripheral" result concrete: those concepts only ever join the tree through **low-support branches**. `laboratorium` and `góry` merge at AU 76; the diffuse `obraz` / `wieszak` / `drzewo` clade sits at AU 64–76 — all below the 80 cutoff, so none of them earns a box. `okno` is the clearest case: it attaches to the building-interior group at only **AU 72**, which is the statistical fingerprint of a **bridge** — a concept too evenly connected to several groups to commit stably to one. So the six peripheral concepts are precisely those whose only available groupings are the weakly-supported branches.
+
+**Two things to keep in mind**
+
+The branch heights here come from pvclust's own internal clustering, so they are not numerically identical to the main dendrogram — read this figure for the **support values**, not for exact merge heights. And because the numbers come from resampling, individual AU values can shift by a point or two between runs unless the random seed is fixed; the seed is set in the code above so the reported values are reproducible.
+
+# Local density across the space
+
+Per **concept**: the mean distance to its `k` nearest neighbours. Small = the concept sits in a crowded neighbourhood; large = it is alone in a sparse region.
+
+```{r local-density}
+knn <- 3
+local_density <- apply(D, 1, function(row) mean(sort(row)[2:(knn + 1)]))  # 1st is self (0)
+knitr::kable(
+  data.frame(concept = names(local_density),
+             knn_mean_dist = round(local_density, 3),
+             row.names = NULL)[order(local_density), ],
+  caption = capTab(sprintf("Local density (mean distance to %d nearest neighbours; lower = denser).", knn)))
+```
+
+The concepts at the bottom are the isolated ones — the sparse regions of the space.
+
+# Nearest neighbour of each concept
+
+```{r nn}
+nn <- t(sapply(rownames(D), function(i) {
+  row <- D[i, ]; row[i] <- Inf
+  j <- which.min(row)
+  c(nearest = names(j), distance = unname(round(row[j], 3)))
+}))
+knitr::kable(data.frame(concept = rownames(nn), nn, row.names = NULL),
+             caption = capTab("Closest concept to each concept."))
+```
+
+Where two concepts are each other's nearest neighbour (e.g. `krzesło`–`kanapa`, `miasto`–`wieś`), the pairing is a reciprocal opposition; non-reciprocal links point from a peripheral concept toward a denser cluster.
+
+# Similarity matrix (all pairwise values)
+
+This grid shows the raw material behind every other figure: the cosine similarity of all 16 concepts with each other. Unlike the network and the map, nothing is thresholded, projected or summarised — each cell is a single true value, so this is the most transparent view of the data.
+
+Rows and columns are ordered by the clustering, so the four groups appear as green blocks along the diagonal. The colour scale is **centred on the average similarity** (green = closer than average, red = further), and the diagonal (each concept with itself) is left blank so it does not dominate the scale. Read it two ways: green blocks on the diagonal are the tight groups, and a concept whose whole row/column is mostly red is one that is far from everything — a peripheral concept.
+
+```{r fig-simmatrix, fig.width=9.5, fig.height=8.5}
+M <- S                                   # cosine similarity: higher = closer
+diag(M) <- NA                            # blank self-similarity so it doesn't dominate the scale
+
+ord <- hclust(as.dist(D), method = "ward.D2")$order   # cluster order -> blocks on the diagonal
+lev <- rownames(D)[ord]
+
+df_tile <- as.data.frame(as.table(M))
+names(df_tile) <- c("row", "col", "sim")
+df_tile$row <- factor(df_tile$row, levels = lev)
+df_tile$col <- factor(df_tile$col, levels = lev)
+
+mid <- mean(M, na.rm = TRUE)             # centre the scale on the average similarity
+rng <- max(abs(df_tile$sim - mid), na.rm = TRUE)
+df_tile$txt <- ifelse(!is.na(df_tile$sim) & abs(df_tile$sim - mid) > 0.6 * rng,
+                      "white", "black")  # white text on the darkest cells for legibility
+
+p_sim <- ggplot(df_tile, aes(row, col, fill = sim)) +
+  geom_tile(colour = "grey92") +
+  geom_text(aes(label = ifelse(is.na(sim), "", sprintf("%.2f", sim)), colour = txt),
+            size = 2.9, fontface = "bold") +
+  scale_colour_identity() +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#1B7837",
+                       midpoint = mid, na.value = "grey95",
+                       name = "cosine\nsimilarity") +
+  # CHANGE FILL TO THIS IF WANNA BE COLORBLIND
+  #scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+  #                     midpoint = mid, na.value = "grey95", name = "cosine\nsimilarity") +
+  scale_y_discrete(limits = rev) +       # diagonal runs top-left -> bottom-right
+  coord_equal() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text   = element_text(face = "bold"),
+        panel.grid  = element_blank())
+
+p_sim
+ggsave(paste0(plots, "similarity_matrix.png"), p_sim, width = 9.5, height = 8.5,
+       dpi = 300, bg = "white")
+```
+`r capFig("Pairwise cosine similarity between all 16 concepts, ordered by clustering. Green = more similar than average, red = less; the diagonal is blank. Green blocks on the diagonal are the clusters; predominantly-red rows/columns are the peripheral concepts.")`
+
+# Notes for the manuscript
+
+- **Method.** Distances are `1 - cosine` of ConceptNet Numberbatch 19.08 vectors
+  (Polish slice), i.e. the same measure as ConceptNet's `/relatedness`; computed
+  in the embedding script and read here.
+- **Sample.** 16 concepts — everything is exploratory/descriptive, not inferential.
+- **Figure fidelity.** The map's 2-D layout is only partially faithful (see the
+  reported stress / GOF); positions are indicative, the tables and
+  nearest-neighbour links are exact.
+- **Cohesive vs peripheral.** Three cohesive groups emerge (furniture; the
+  building-interior set; the `miasto`–`wieś` pair). `drzewo`, `góry`, `obraz`,
+  `laboratorium`, `wieszak` are peripheral — far from everything — and are *not*
+  a real cluster.
+- **`pokój`** blends two senses (room / peace) in one vector, so read its position
+  with mild caution.
+- **Provenance.** These distances reflect Numberbatch's ensemble (ConceptNet,
+  word2vec, GloVe, OpenSubtitles) and its Polish coverage — a model of meaning,
+  not a ground truth.
