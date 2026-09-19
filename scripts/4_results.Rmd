@@ -173,7 +173,6 @@ contrasts(df_single$distance) <- matrix(c(-0.5, 0.5), nrow = 2,
 #################### preregistered ROPE bounds (log-odds) ####################
 ROPE      <- 0.18   # primary half-width
 ROPE_SENS <- 0.30   # sensitivity bound
-
 #################### position of a 95% CrI relative to a ROPE ####################
 rope_position <- function(lo, hi, r) {
   if (hi < -r)                     "entirely below the ROPE"
@@ -181,8 +180,11 @@ rope_position <- function(lo, hi, r) {
   else if (lo > -r && hi <  r)     "entirely within the ROPE"
   else                             "straddling a ROPE boundary"
 }
-
-#################### one coefficient: mean, 95% CrI, pd, ROPE position ####################
+#################### one coefficient: median, 95% CrI, pd, ROPE position ####################
+# Proportions are returned for both the primary and the sensitivity half-width,
+# and p_dir is the probability of lying beyond the region in whichever direction
+# the posterior favors, so that nothing reported in the prose has to be
+# recomputed from the draws downstream.
 rope_report <- function(fit, coef, rope = ROPE, sens = ROPE_SENS) {
   d <- posterior::as_draws_df(fit)
   if (!coef %in% names(d))
@@ -192,21 +194,27 @@ rope_report <- function(fit, coef, rope = ROPE, sens = ROPE_SENS) {
   lo <- unname(quantile(x, 0.025))
   hi <- unname(quantile(x, 0.975))
   tibble(
-    coef          = coef,
-    m             = median(x),
-    lo            = lo,
-    hi            = hi,
-    pd            = max(mean(x > 0), mean(x < 0)),
-    pct_in_rope   = mean(x > -rope & x < rope),
-    p_above       = mean(x >  rope),
-    p_below       = mean(x < -rope),
-    position      = rope_position(lo, hi, rope),
-    position_sens = rope_position(lo, hi, sens)
+    coef             = coef,
+    m                = median(x),
+    lo               = lo,
+    hi               = hi,
+    pd               = max(mean(x > 0), mean(x < 0)),
+    pct_in_rope      = mean(x > -rope & x < rope),
+    p_above          = mean(x >  rope),
+    p_below          = mean(x < -rope),
+    p_dir            = max(mean(x > rope), mean(x < -rope)),
+    position         = rope_position(lo, hi, rope),
+    pct_in_rope_sens = mean(x > -sens & x < sens),
+    p_above_sens     = mean(x >  sens),
+    p_below_sens     = mean(x < -sens),
+    p_dir_sens       = max(mean(x > sens), mean(x < -sens)),
+    position_sens    = rope_position(lo, hi, sens)
   )
 }
-
 #################### map a ROPE position to a preregistered decision ####################
 # support_when: "below" | "above" | "within"  (the predicted relation to the ROPE)
+# Unchanged: this implements the registered rule verbatim, including its
+# treatment of a straddling interval as inconclusive.
 rope_decision <- function(rep_row, support_when) {
   pos <- rep_row$position
   supported <- switch(support_when,
@@ -217,17 +225,25 @@ rope_decision <- function(rep_row, support_when) {
   else if (grepl("straddling", pos)) "inconclusive"
   else                              "not supported"
 }
-
 #################### tidy printer (rounded copy for display) ####################
-show_rope <- function(rep_row, digits = 2)
-  rep_row %>% mutate(across(c(m, lo, hi), ~round(.x, digits)),
-                     across(c(pd, pct_in_rope, p_above, p_below), ~round(.x, 3)))
-
+# sens = FALSE keeps the console view at its previous width; the sensitivity
+# proportions are still present in the underlying object either way.
+show_rope <- function(rep_row, digits = 2, sens = FALSE) {
+  out <- rep_row %>%
+    mutate(across(c(m, lo, hi), ~ round(.x, digits)),
+           across(c(pd, pct_in_rope, p_above, p_below, p_dir,
+                    pct_in_rope_sens, p_above_sens, p_below_sens, p_dir_sens),
+                  ~ round(.x, 3)))
+  if (isFALSE(sens))
+    out <- dplyr::select(out, -c(pct_in_rope_sens, p_above_sens,
+                                 p_below_sens, p_dir_sens))
+  out
+}
 #################### 2x2 design grid, with model contrasts ####################
 design_grid <- df %>% dplyr::distinct(size, distance) %>% dplyr::arrange(size, distance)
-
 #################### predicted cell probabilities (population level) ####################
 # extra = named list of any additional predictors to hold fixed (e.g. icon_c = 0)
+# Point estimate is the posterior median: a single unconstrained probability.
 cell_probs <- function(fit, extra = NULL) {
   nd <- design_grid
   for (nm in names(extra)) nd[[nm]] <- extra[[nm]]
@@ -238,13 +254,15 @@ cell_probs <- function(fit, extra = NULL) {
               lo = quantile(.epred, 0.025),
               hi = quantile(.epred, 0.975), .groups = "drop")
 }
-
-# categorical version keeps the .category column
+# Categorical version keeps the .category column. Point estimate is the
+# posterior MEAN, not the median: within each draw the category probabilities
+# sum to one, and averaging preserves that sum while taking medians does not.
+# This is what makes the stacked configuration figure add to 100%.
 cell_probs_cat <- function(fit) {
   design_grid %>%
     add_epred_draws(fit, re_formula = NA) %>%
     group_by(size, distance, .category) %>%
-    summarise(p  = median(.epred),
+    summarise(p  = mean(.epred),
               lo = quantile(.epred, 0.025),
               hi = quantile(.epred, 0.975), .groups = "drop")
 }
@@ -402,6 +420,7 @@ The categorical configuration model reproduces the observed frequency of all fou
 ## H1. Communicative success by referent size
 
 ```{r h1, echo=TRUE, message=FALSE, warning=FALSE}
+m_success
 h1        <- rope_report(m_success, "b_sizecompl")
 h1_dec    <- rope_decision(h1, "below")           # complete < element
 h1_probs  <- cell_probs(m_success, extra = list(icon_c = 0, index_c = 0))
@@ -413,6 +432,19 @@ The size effect on communicative success is `r round(h1$m, 2)` log-odds (95% CrI
 On the probability scale, averaged over distance and with both strategy covariates held at the midpoint of their sum coding, element referents are communicated correctly `r round(100 * mean(h1_probs$p[h1_probs$size == "element"]), 1)`% of the time and complete spatial frames `r round(100 * mean(h1_probs$p[h1_probs$size == "complete"]), 1)`% of the time -- a difference of roughly 32 percentage points, corresponding to an odds ratio of about 0.17. The effect is visible in every cell of the design: within proximate trials, success falls from 84.5% for elements to 30.0% for complete frames, and within displaced trials from 40.9% to 20.8%.
 
 This is the most securely estimated of our registered effects. It is classified below the region of practical equivalence under the primary bound, under the sensitivity bound, and under both alternative prior specifications reported in the sensitivity analysis; the posterior is 2.8 times narrower than the prior it was fitted with, so the estimate is determined by the data rather than by our prior assumptions.
+
+```{r}
+purrr::map_dfr(
+  list(success = m_success, icon = m_icon, index = m_index),
+  ~ tibble::tibble(
+      sd_item_median = median(posterior::as_draws_df(.x)$sd_item__Intercept),
+      sd_item_lo     = quantile(posterior::as_draws_df(.x)$sd_item__Intercept, 0.025),
+      sd_item_hi     = quantile(posterior::as_draws_df(.x)$sd_item__Intercept, 0.975)
+    ),
+  .id = "model"
+) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 2)))
+```
 
 ## H2 (no difference). Success by spatial distance
 
@@ -431,6 +463,7 @@ We therefore report that the data do not support the no-difference component of 
 ## H2a. Icon use by spatial distance
 
 ```{r h2a, echo=TRUE, message=FALSE, warning=FALSE}
+m_icon
 h2a       <- rope_report(m_icon, "b_distancedispl")
 h2a_dec   <- rope_decision(h2a, "above")           # displaced -> more icon
 h2a_probs <- cell_probs(m_icon)
@@ -446,7 +479,9 @@ What the data determine here is the direction of the effect; what they do not de
 ## H2b. Index use by spatial distance
 
 ```{r h2b, echo=TRUE, message=FALSE, warning=FALSE}
+m_index
 h2b       <- rope_report(m_index, "b_distancedispl")
+h2b_int   <- rope_report(m_index, "b_sizecompl:distancedispl")
 h2b_dec   <- rope_decision(h2b, "below")           # proximate -> more index
 h2b_probs <- cell_probs(m_index)
 show_rope(h2b)
@@ -457,6 +492,131 @@ In the index model the distance slope is `r round(h2b$m, 2)` log-odds (95% CrI [
 As with H2a, the direction is the predicted one and is well determined: `r round(100 * h2b$pd, 1)`% of the posterior lies below zero and `r round(100 * h2b$pct_in_rope, 1)`% falls within the ROPE. Index use falls from `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "proximate"]), 1)`% for proximate referents to `r round(100 * mean(h2b_probs$p[h2b_probs$distance == "displaced"]), 1)`% for displaced ones, and here too the shift is carried by element referents (75.8% to 27.5%) rather than by complete frames (29.2% to 30.0%).
 
 This estimate is the better determined of the two strategy effects: its interval is 1.88 log-odds wide, within our preregistered precision criterion, and the posterior is 3.3 times narrower than its prior. Taken together with H2a, the two models describe the same reciprocal pattern from opposite sides -- displaced referents draw more iconic and fewer indexical strategies -- with each estimate falling just short of the threshold the preregistration set for declaring the effect established.
+
+## Percent contrasts
+
+```{r pct_contrasts, echo=TRUE, message=FALSE, warning=FALSE}
+# ---- pct_contrasts ----------------------------------------------------------
+# Effects on the percentage-point scale, with credible intervals. The Results
+# text reports estimate + interval + probability, so the interval has to be
+# computed on the same scale as the estimate rather than converted afterwards.
+pct_contrast <- function(fit, keep, drop, extra = NULL) {
+  nd <- df %>% dplyr::distinct(size, distance) %>% dplyr::arrange(size, distance)
+  for (nm in names(extra)) nd[[nm]] <- extra[[nm]]
+  ep <- brms::posterior_epred(fit, newdata = nd, re_formula = NA)
+  d  <- rowMeans(ep[, keep(nd), drop = FALSE]) - rowMeans(ep[, drop(nd), drop = FALSE])
+  tibble::tibble(est = median(d), lo = quantile(d, 0.025), hi = quantile(d, 0.975)) %>%
+    dplyr::mutate(dplyr::across(everything(), ~ round(100 * .x, 1)))
+}
+
+is_complete  <- function(nd) nd$size     == "complete"
+is_element   <- function(nd) nd$size     == "element"
+is_displaced <- function(nd) nd$distance == "displaced"
+is_proximate <- function(nd) nd$distance == "proximate"
+
+strat0 <- list(icon_c = 0, index_c = 0)
+
+# H1 and H2: effects on communicative success
+pct_h1     <- pct_contrast(m_success,         is_complete,  is_element,   strat0)
+pct_h1_tot <- pct_contrast(m_success_nostrat, is_complete,  is_element)
+pct_h2n    <- pct_contrast(m_success,         is_displaced, is_proximate, strat0)
+
+# H2a and H2b: effects on strategy use
+pct_h2a <- pct_contrast(m_icon,  is_displaced, is_proximate)
+pct_h2b <- pct_contrast(m_index, is_displaced, is_proximate)
+
+# Registered single-choice model (fitted to df_single, so its own grid)
+nd_reg <- m_repstrat_registered$data %>% dplyr::distinct(size, distance)
+ep_reg <- brms::posterior_epred(m_repstrat_registered, newdata = nd_reg, re_formula = NA)
+d_reg  <- rowMeans(ep_reg[, nd_reg$distance == "displaced", drop = FALSE]) -
+          rowMeans(ep_reg[, nd_reg$distance == "proximate", drop = FALSE])
+pct_reg <- tibble::tibble(est = median(d_reg),
+                          lo = quantile(d_reg, 0.025),
+                          hi = quantile(d_reg, 0.975)) %>%
+  dplyr::mutate(dplyr::across(everything(), ~ round(100 * .x, 1)))
+
+# Strategy use and success: index used vs not, other strategy held at midpoint
+nd_s <- df %>% dplyr::distinct(size, distance) %>%
+  tidyr::crossing(tibble::tibble(index_c = c(-0.5, 0.5))) %>%
+  dplyr::mutate(icon_c = 0)
+ep_s <- brms::posterior_epred(m_success, newdata = nd_s, re_formula = NA)
+d_ix <- rowMeans(ep_s[, nd_s$index_c ==  0.5, drop = FALSE]) -
+        rowMeans(ep_s[, nd_s$index_c == -0.5, drop = FALSE])
+pct_index_succ <- tibble::tibble(est = median(d_ix),
+                                 lo = quantile(d_ix, 0.025),
+                                 hi = quantile(d_ix, 0.975)) %>%
+  dplyr::mutate(dplyr::across(everything(), ~ round(100 * .x, 1)))
+
+nd_c <- df %>% dplyr::distinct(size, distance) %>%
+  tidyr::crossing(tibble::tibble(icon_c = c(-0.5, 0.5))) %>%
+  dplyr::mutate(index_c = 0)
+ep_c <- brms::posterior_epred(m_success, newdata = nd_c, re_formula = NA)
+d_ic <- rowMeans(ep_c[, nd_c$icon_c ==  0.5, drop = FALSE]) -
+        rowMeans(ep_c[, nd_c$icon_c == -0.5, drop = FALSE])
+pct_icon_succ <- tibble::tibble(est = median(d_ic),
+                                lo = quantile(d_ic, 0.025),
+                                hi = quantile(d_ic, 0.975)) %>%
+  dplyr::mutate(dplyr::across(everything(), ~ round(100 * .x, 1)))
+
+# probabilities for the two unregistered strategy-success effects
+icon_succ  <- rope_report(m_success, "b_icon_c")
+index_succ <- rope_report(m_success, "b_index_c")
+
+pct_table <- dplyr::bind_rows(
+  dplyr::mutate(pct_h1,          effect = "size -> success"),
+  dplyr::mutate(pct_h1_tot,      effect = "size -> success (total)"),
+  dplyr::mutate(pct_h2n,         effect = "distance -> success"),
+  dplyr::mutate(pct_h2a,         effect = "distance -> icon"),
+  dplyr::mutate(pct_h2b,         effect = "distance -> index"),
+  dplyr::mutate(pct_reg,         effect = "distance -> strategy (registered)"),
+  dplyr::mutate(pct_index_succ,  effect = "index -> success"),
+  dplyr::mutate(pct_icon_succ,   effect = "icon -> success")
+) %>% dplyr::relocate(effect)
+
+pct_table
+```
+
+## Reporting table
+
+```{r}
+# ---- reporting_table --------------------------------------------------------
+# Single source for every number quoted in Sections 3.1 and 3.2. Inline `r`
+# calls read from `table1`; nothing in the prose is computed anywhere else.
+# Requires the revised rope_report(), so re-run every rope_report() call above
+# before this chunk.
+
+rope_rows <- dplyr::bind_rows(
+  dplyr::mutate(h1,         effect = "size -> success"),
+  dplyr::mutate(h1_tot,     effect = "size -> success (total)"),
+  dplyr::mutate(h2n,        effect = "distance -> success"),
+  dplyr::mutate(h2a,        effect = "distance -> icon"),
+  dplyr::mutate(h2b,        effect = "distance -> index"),
+  dplyr::mutate(regA,       effect = "distance -> strategy (registered)"),
+  dplyr::mutate(index_succ, effect = "index -> success"),
+  dplyr::mutate(icon_succ,  effect = "icon -> success")
+) %>%
+  dplyr::select(effect, coef, lor_m = m, lor_lo = lo, lor_hi = hi,
+                pd, pct_in_rope, p_above, p_below, p_dir,
+                pct_in_rope_sens, p_above_sens, p_below_sens, p_dir_sens,
+                position, position_sens)
+
+table1 <- rope_rows %>%
+  dplyr::left_join(dplyr::rename(pct_table, pp_est = est, pp_lo = lo, pp_hi = hi),
+                   by = "effect") %>%
+  dplyr::relocate(effect, pp_est, pp_lo, pp_hi, lor_m, lor_lo, lor_hi,
+                  p_dir, pct_in_rope, p_dir_sens, pct_in_rope_sens)
+
+stopifnot(nrow(table1) == 8L, !any(is.na(table1$pp_est)))
+
+saveRDS(table1,      paste0(data, "table1.rds"))
+saveRDS(pct_table,   paste0(data, "pct_contrasts.rds"))
+saveRDS(combo_probs, paste0(data, "combo_probs.rds"))
+saveRDS(lapply(models_list, brms::posterior_summary),
+        paste0(data, "posterior_summaries.rds"))
+
+table1
+```
+
 
 ## Confirmatory effects against the ROPE
 
@@ -533,7 +693,8 @@ p_cells <- ggplot(pred_all, aes(distance, p, colour = size, group = size)) +
   geom_point(position = pd, size = 4) +
   geom_point(aes(y = obs), position = pd, size = 3.4, shape = 5, stroke = 1.1) +
   facet_wrap(~ outcome) +
-  scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
+    scale_colour_manual(values = colorBlindBlack8[c(4, 7)],
+                      labels = c(element = "small", complete = "large")) +
   scale_y_continuous(labels = scales::percent, limits = c(0, 1),
                      breaks = seq(0, 1, 0.25)) +
   labs(x = NULL, y = "Probability", colour = "Referent size") +
@@ -552,7 +713,7 @@ ggsave(paste0(plots, "fig_cells.svg"), p_cells, width = 11, height = 6.5, bg = "
 
 ## Communicative success by item
 
-```{r fig_items, echo=FALSE, fig.align='left', fig.cap=capFig("Communicative success by item (30 productions each). Filled points are model-implied posterior medians with 95% credible intervals, including the by-item intercept and marginalising over producer and guesser; open diamonds are the observed proportions correct. Colour encodes referent size, shape encodes spatial distance. Items are ordered by posterior median."), fig.height=9, fig.width=10, message=FALSE, warning=FALSE}
+```{r fig_items, echo=FALSE, fig.align='left', fig.cap=capFig("Communicative success by item (30 productions each). Filled points are model-implied posterior medians with 95% credible intervals, including the by-item intercept and marginalising over producer and guesser, with iconic and indexical representation held at their midpoint; open diamonds are the observed proportions correct. Colour encodes referent size, shape encodes spatial distance. Items are ordered by posterior median."), fig.height=9, fig.width=10, message=FALSE, warning=FALSE}
 # one row per item, carrying its design cell; strategy covariates at the midpoint
 item_grid <- df %>%
   distinct(item, story_id, target, size, distance) %>%
@@ -579,7 +740,8 @@ p_items <- ggplot(item_tbl, aes(p, target, colour = size, shape = distance)) +
   geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 1, alpha = 0.85) +
   geom_point(size = 4) +
   geom_point(aes(x = obs), shape = 5, size = 3.4, stroke = 1.1) +
-  scale_colour_manual(values = colorBlindBlack8[c(4, 7)]) +
+  scale_colour_manual(values = colorBlindBlack8[c(4, 7)],
+                      labels = c(element = "small", complete = "large")) +
   scale_shape_manual(values = c(proximate = 16, displaced = 17)) +
   scale_x_continuous(labels = scales::percent, limits = c(0, 1),
                      breaks = seq(0, 1, 0.25)) +
@@ -602,15 +764,43 @@ ggsave(paste0(plots, "fig_items.svg"), p_items, width = 10, height = 9, bg = "wh
 ```
 
 ```{r tab_items, echo=TRUE, message=FALSE, warning=FALSE}
-item_shrink <- item_tbl %>%
-  mutate(shrinkage = round(100 * (obs - p), 1),
+item_diff <- item_tbl %>%
+  mutate(difference = round(100 * (obs - p), 1),
          across(c(p, obs), ~ round(100 * .x, 1))) %>%
-  select(target, story_id, size, distance, n, observed = obs, fitted = p, shrinkage) %>%
-  arrange(desc(abs(shrinkage)))
+  select(target, story_id, size, distance, n, observed = obs, fitted = p, difference) %>%
+  arrange(desc(abs(difference)))
 
-knitr::kable(item_shrink, row.names = FALSE,
-  caption = capTab("Observed and model-implied success rates per item, ordered by the size of the shrinkage toward the design cell. Positive shrinkage means the raw proportion exceeds the model estimate."))
+knitr::kable(item_diff, row.names = FALSE,
+  caption = capTab("Observed and model-implied success rates per item, ordered by the size of the difference between them. The model-implied rate holds iconic and indexical representation at their midpoint, so items that attracted unusually heavy strategy use are adjusted downward relative to their observed rate."))
 ```
+
+```{r}
+# ---- item_profile -----------------------------------------------------------
+semantic_items <- readRDS(paste0(output, "semantic_items.rds"))
+
+item_profile <- df %>%
+  group_by(story_id, target, size, distance) %>%
+  summarise(n         = n(),
+            icon_obs  = mean(icon),
+            index_obs = mean(index),
+            prop_obs  = mean(prop),
+            both_obs  = mean(icon == 1 & index == 1),
+            .groups   = "drop") %>%
+  left_join(select(item_tbl, story_id, fitted = p, observed = obs), by = "story_id") %>%
+  left_join(semantic_items, by = "target") %>%
+  mutate(across(c(observed, fitted, icon_obs, index_obs, prop_obs, both_obs),
+                ~ round(100 * .x, 1)),
+         density = round(density, 3)) %>%
+  select(target, size, distance, n, observed, fitted,
+         icon_obs, index_obs, prop_obs, both_obs, cluster, density) %>%
+  arrange(desc(fitted))
+
+knitr::kable(item_profile, row.names = FALSE,
+  caption = capTab("Per-item profile: observed and model-implied success, observed strategy use, and semantic position."))
+
+item_profile
+```
+
 
 The by-item random intercept allows communicative success to vary across the 16 stimuli beyond what referent size and spatial distance predict, and the variation it captures is substantial. Model-implied success rates span from 8.4% for *house* to 93.8% for *painting* -- a range considerably wider than the 32-point gap between the two levels of referent size.
 
@@ -637,6 +827,7 @@ We report the interaction coefficients themselves without interpretation, as the
 ### Model B without strategy covariates
 
 ```{r rob_nostrat, echo=TRUE, message=FALSE, warning=FALSE}
+m_success_nostrat
 h1_tot     <- rope_report(m_success_nostrat, "b_sizecompl")
 h1_tot_dec <- rope_decision(h1_tot, "below")
 show_rope(h1_tot)
@@ -649,6 +840,7 @@ The total effect is indistinguishable from the adjusted estimate of `r round(h1$
 ### Registered single-binary Model A
 
 ```{r rob_registered, echo=TRUE, message=FALSE, warning=FALSE}
+m_repstrat_registered
 # outcome = 1 for index; displaced -> more icon = displaced -> less index,
 # so the registered directional effect is a distance slope below the ROPE.
 regA     <- rope_report(m_repstrat_registered, "b_distancedispl")
@@ -713,6 +905,7 @@ These models were not preregistered; they are reported without ROPE decisions, a
 ## The third strategy (prop)
 
 ```{r expl_prop, echo=TRUE, message=FALSE, warning=FALSE}
+m_prop
 prop_dist  <- rope_report(m_prop, "b_distancedispl")
 prop_size  <- rope_report(m_prop, "b_sizecompl")
 prop_probs <- cell_probs(m_prop)
@@ -728,6 +921,7 @@ The pattern is nonetheless coherent with the account we give for the registered 
 ## Icon-index co-occurrence
 
 ```{r expl_both, echo=TRUE, message=FALSE, warning=FALSE}
+m_both
 both_dist  <- rope_report(m_both, "b_distancedispl")
 both_size  <- rope_report(m_both, "b_sizecompl")
 both_int   <- rope_report(m_both, "b_sizecompl:distancedispl")
@@ -795,6 +989,7 @@ ggsave(paste0(plots, "fig_strategy_success.svg"), p_strat, width = 9, height = 6
 ## Four-way configuration
 
 ```{r expl_combo, echo=TRUE, message=FALSE, warning=FALSE}
+m_combo
 combo_probs <- cell_probs_cat(m_combo)
 combo_probs
 ```
@@ -840,6 +1035,25 @@ p_combo <- ggplot(combo_stack, aes(distance, p, fill = .category)) +
 p_combo
 ggsave(paste0(plots, "fig_combo.png"), p_combo, width = 10, height = 6.5, dpi = 600, bg = "white")
 ggsave(paste0(plots, "fig_combo.svg"), p_combo, width = 10, height = 6.5, bg = "white")
+```
+
+## Expl percent contrasts
+
+```{r}
+# ---- pct_contrasts_expl -----------------------------------------------------
+pct_prop_size  <- pct_contrast(m_prop, is_complete,  is_element)
+pct_prop_dist  <- pct_contrast(m_prop, is_displaced, is_proximate)
+pct_both_size  <- pct_contrast(m_both, is_complete,  is_element)
+pct_both_dist  <- pct_contrast(m_both, is_displaced, is_proximate)
+
+pct_expl <- dplyr::bind_rows(
+  dplyr::mutate(pct_prop_size, effect = "size -> prop"),
+  dplyr::mutate(pct_prop_dist, effect = "distance -> prop"),
+  dplyr::mutate(pct_both_size, effect = "size -> both"),
+  dplyr::mutate(pct_both_dist, effect = "distance -> both")
+) %>% dplyr::relocate(effect)
+
+pct_expl
 ```
 
 

@@ -159,17 +159,17 @@
 <text x='66.93' y='136.66' text-anchor='end' style='font-size: 14.40px; font-family: "Arial";' textLength='28.80px' lengthAdjust='spacingAndGlyphs'>75%</text>
 <text x='66.93' y='57.60' text-anchor='end' style='font-size: 14.40px; font-family: "Arial";' textLength='36.80px' lengthAdjust='spacingAndGlyphs'>100%</text>
 <text transform='translate(21.85,210.57) rotate(-90)' text-anchor='middle' style='font-size: 18.00px; font-family: "Arial";' textLength='84.06px' lengthAdjust='spacingAndGlyphs'>Probability</text>
-<text x='285.98' y='447.87' style='font-size: 18.00px; font-family: "Arial";' textLength='106.08px' lengthAdjust='spacingAndGlyphs'>Referent size</text>
-<line x1='402.75' y1='441.43' x2='416.57' y2='441.43' style='stroke-width: 2.13; stroke: #009E73; stroke-linecap: butt;' />
-<line x1='409.66' y1='448.34' x2='409.66' y2='434.52' style='stroke-width: 2.35; stroke: #009E73; stroke-linecap: butt;' />
-<circle cx='409.66' cy='441.43' r='4.85' style='stroke-width: 1.16; stroke: #009E73; fill: #009E73;' />
-<polygon points='403.43,441.43 409.66,435.19 415.89,441.43 409.66,447.66 ' style='stroke-width: 1.56; stroke: #009E73;' />
-<line x1='489.15' y1='441.43' x2='502.97' y2='441.43' style='stroke-width: 2.13; stroke: #D55E00; stroke-linecap: butt;' />
-<line x1='496.06' y1='448.34' x2='496.06' y2='434.52' style='stroke-width: 2.35; stroke: #D55E00; stroke-linecap: butt;' />
-<circle cx='496.06' cy='441.43' r='4.85' style='stroke-width: 1.16; stroke: #D55E00; fill: #D55E00;' />
-<polygon points='489.83,441.43 496.06,435.19 502.29,441.43 496.06,447.66 ' style='stroke-width: 1.56; stroke: #D55E00;' />
-<text x='427.27' y='446.58' style='font-size: 14.40px; font-family: "Arial";' textLength='51.19px' lengthAdjust='spacingAndGlyphs'>element</text>
-<text x='513.67' y='446.58' style='font-size: 14.40px; font-family: "Arial";' textLength='58.39px' lengthAdjust='spacingAndGlyphs'>complete</text>
+<text x='307.97' y='447.87' style='font-size: 18.00px; font-family: "Arial";' textLength='106.08px' lengthAdjust='spacingAndGlyphs'>Referent size</text>
+<line x1='424.74' y1='441.43' x2='438.56' y2='441.43' style='stroke-width: 2.13; stroke: #009E73; stroke-linecap: butt;' />
+<line x1='431.65' y1='448.34' x2='431.65' y2='434.52' style='stroke-width: 2.35; stroke: #009E73; stroke-linecap: butt;' />
+<circle cx='431.65' cy='441.43' r='4.85' style='stroke-width: 1.16; stroke: #009E73; fill: #009E73;' />
+<polygon points='425.42,441.43 431.65,435.19 437.88,441.43 431.65,447.66 ' style='stroke-width: 1.56; stroke: #009E73;' />
+<line x1='493.55' y1='441.43' x2='507.37' y2='441.43' style='stroke-width: 2.13; stroke: #D55E00; stroke-linecap: butt;' />
+<line x1='500.46' y1='448.34' x2='500.46' y2='434.52' style='stroke-width: 2.35; stroke: #D55E00; stroke-linecap: butt;' />
+<circle cx='500.46' cy='441.43' r='4.85' style='stroke-width: 1.16; stroke: #D55E00; fill: #D55E00;' />
+<polygon points='494.23,441.43 500.46,435.19 506.69,441.43 500.46,447.66 ' style='stroke-width: 1.56; stroke: #D55E00;' />
+<text x='449.26' y='446.58' style='font-size: 14.40px; font-family: "Arial";' textLength='33.59px' lengthAdjust='spacingAndGlyphs'>small</text>
+<text x='518.06' y='446.58' style='font-size: 14.40px; font-family: "Arial";' textLength='32.00px' lengthAdjust='spacingAndGlyphs'>large</text>
 </g>
 </g>
 </svg>

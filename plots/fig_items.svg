@@ -127,20 +127,20 @@
 <text x='542.88' y='493.32' text-anchor='middle' style='font-size: 13.60px; font-family: "Arial";' textLength='27.22px' lengthAdjust='spacingAndGlyphs'>75%</text>
 <text x='683.42' y='493.32' text-anchor='middle' style='font-size: 13.60px; font-family: "Arial";' textLength='34.78px' lengthAdjust='spacingAndGlyphs'>100%</text>
 <text x='402.33' y='512.59' text-anchor='middle' style='font-size: 17.00px; font-family: "Arial";' textLength='74.59px' lengthAdjust='spacingAndGlyphs'>P(correct)</text>
-<text x='266.27' y='556.30' style='font-size: 17.00px; font-family: "Arial";' textLength='100.14px' lengthAdjust='spacingAndGlyphs'>Referent size</text>
-<line x1='376.61' y1='550.21' x2='390.43' y2='550.21' style='stroke-width: 2.13; stroke: #009E73; stroke-opacity: 0.85; stroke-linecap: butt;' />
-<circle cx='383.52' cy='550.21' r='4.82' style='stroke-width: 1.10; stroke: #009E73; fill: #009E73;' />
-<polygon points='377.29,550.21 383.52,543.98 389.76,550.21 383.52,556.44 ' style='stroke-width: 1.56; stroke: #009E73;' />
-<line x1='459.20' y1='550.21' x2='473.03' y2='550.21' style='stroke-width: 2.13; stroke: #D55E00; stroke-opacity: 0.85; stroke-linecap: butt;' />
-<circle cx='466.11' cy='550.21' r='4.82' style='stroke-width: 1.10; stroke: #D55E00; fill: #D55E00;' />
-<polygon points='459.88,550.21 466.11,543.98 472.35,550.21 466.11,556.44 ' style='stroke-width: 1.56; stroke: #D55E00;' />
-<text x='400.63' y='555.08' style='font-size: 13.60px; font-family: "Arial";' textLength='48.38px' lengthAdjust='spacingAndGlyphs'>element</text>
-<text x='483.22' y='555.08' style='font-size: 13.60px; font-family: "Arial";' textLength='55.17px' lengthAdjust='spacingAndGlyphs'>complete</text>
-<text x='249.54' y='607.45' style='font-size: 17.00px; font-family: "Arial";' textLength='120.02px' lengthAdjust='spacingAndGlyphs'>Spatial distance</text>
-<circle cx='386.66' cy='601.36' r='4.82' style='stroke-width: 1.10; stroke: none; fill: #000000;' />
-<polygon points='480.58,593.87 487.07,605.11 474.10,605.11 ' style='stroke-width: 1.10; stroke: none; fill: #000000;' />
-<text x='403.77' y='606.23' style='font-size: 13.60px; font-family: "Arial";' textLength='59.70px' lengthAdjust='spacingAndGlyphs'>proximate</text>
-<text x='497.69' y='606.23' style='font-size: 13.60px; font-family: "Arial";' textLength='57.44px' lengthAdjust='spacingAndGlyphs'>displaced</text>
+<text x='249.54' y='556.30' style='font-size: 17.00px; font-family: "Arial";' textLength='120.02px' lengthAdjust='spacingAndGlyphs'>Spatial distance</text>
+<circle cx='386.66' cy='550.21' r='4.82' style='stroke-width: 1.10; stroke: none; fill: #000000;' />
+<polygon points='480.58,542.72 487.07,553.95 474.10,553.95 ' style='stroke-width: 1.10; stroke: none; fill: #000000;' />
+<text x='403.77' y='555.08' style='font-size: 13.60px; font-family: "Arial";' textLength='59.70px' lengthAdjust='spacingAndGlyphs'>proximate</text>
+<text x='497.69' y='555.08' style='font-size: 13.60px; font-family: "Arial";' textLength='57.44px' lengthAdjust='spacingAndGlyphs'>displaced</text>
+<text x='287.07' y='607.45' style='font-size: 17.00px; font-family: "Arial";' textLength='100.14px' lengthAdjust='spacingAndGlyphs'>Referent size</text>
+<line x1='397.41' y1='601.36' x2='411.23' y2='601.36' style='stroke-width: 2.13; stroke: #009E73; stroke-opacity: 0.85; stroke-linecap: butt;' />
+<circle cx='404.32' cy='601.36' r='4.82' style='stroke-width: 1.10; stroke: #009E73; fill: #009E73;' />
+<polygon points='398.09,601.36 404.32,595.13 410.55,601.36 404.32,607.60 ' style='stroke-width: 1.56; stroke: #009E73;' />
+<line x1='463.34' y1='601.36' x2='477.17' y2='601.36' style='stroke-width: 2.13; stroke: #D55E00; stroke-opacity: 0.85; stroke-linecap: butt;' />
+<circle cx='470.25' cy='601.36' r='4.82' style='stroke-width: 1.10; stroke: #D55E00; fill: #D55E00;' />
+<polygon points='464.02,601.36 470.25,595.13 476.49,601.36 470.25,607.60 ' style='stroke-width: 1.56; stroke: #D55E00;' />
+<text x='421.43' y='606.23' style='font-size: 13.60px; font-family: "Arial";' textLength='31.72px' lengthAdjust='spacingAndGlyphs'>small</text>
+<text x='487.36' y='606.23' style='font-size: 13.60px; font-family: "Arial";' textLength='30.23px' lengthAdjust='spacingAndGlyphs'>large</text>
 <text x='93.14' y='636.67' style='font-size: 13.60px; font-family: "Arial";' textLength='277.80px' lengthAdjust='spacingAndGlyphs'>Open diamonds = observed proportion correct</text>
 </g>
 </g>
